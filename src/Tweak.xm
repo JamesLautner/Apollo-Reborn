@@ -932,6 +932,97 @@ static void initializeRandomSources() {
     });
 }
 
+// MARK: - ApolloTabBarController Hooks
+
+%hook ApolloTabBarController
+
+- (void)viewDidLoad {
+    %orig;
+
+    // Listen for changes to postSnapshots so we can update our internal dictionary
+    [[NSUserDefaults standardUserDefaults] addObserver:self
+                                            forKeyPath:UDKeyApolloPostCommentsSnapshots
+                                               options:NSKeyValueObservingOptionNew
+                                               context:NULL];
+
+    // Apply tab bar layout tweaks based on user prefs
+    BOOL searchRight   = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchTabRight];
+    BOOL shrinkOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarShrinkOnScroll];
+
+    if (searchRight) {
+        [self apollo_moveSearchTabToEnd];
+    }
+
+    [self apollo_applyMinimizationBehavior:shrinkOnScroll];
+}
+
+// ─── Search tab reordering ────────────────────────────────────────────────────
+// Iterates viewControllers and moves the one whose tabBarItem.title == "Search"
+// to the last position.  Safe to call multiple times (idempotent).
+%new - (void)apollo_moveSearchTabToEnd {
+    NSArray *vcs = self.viewControllers;
+    if (vcs.count < 2) return;
+
+    NSMutableArray *mutable = [vcs mutableCopy];
+    for (NSInteger i = 0; i < (NSInteger)mutable.count - 1; i++) {
+        UIViewController *vc = mutable[i];
+        if ([vc.tabBarItem.title isEqualToString:@"Search"]) {
+            [mutable removeObjectAtIndex:i];
+            [mutable addObject:vc];
+            self.viewControllers = [mutable copy];
+            return;
+        }
+    }
+    // If title-based match fails, fall back to class name check
+    for (NSInteger i = 0; i < (NSInteger)mutable.count - 1; i++) {
+        UIViewController *vc = mutable[i];
+        UIViewController *root = vc;
+        if ([root isKindOfClass:[UINavigationController class]]) {
+            root = [(UINavigationController *)root topViewController];
+        }
+        NSString *className = NSStringFromClass([root class]);
+        if ([className containsString:@"Search"]) {
+            [mutable removeObjectAtIndex:i];
+            [mutable addObject:vc];
+            self.viewControllers = [mutable copy];
+            return;
+        }
+    }
+}
+
+// ─── Collapse / always-expanded behaviour ────────────────────────────────────
+// UITabBarMinimizationBehavior (iOS 26+):
+//   0 = automatic  →  collapses on scroll-down, re-expands on scroll-up (Apple Music style)
+//   1 = never      →  tab bar always stays fully expanded
+//
+// Uses KVC so this compiles without the iOS 26 SDK and fails gracefully on older OS.
+%new - (void)apollo_applyMinimizationBehavior:(BOOL)shrinkOnScroll {
+    if (@available(iOS 26, *)) {
+        SEL setter = NSSelectorFromString(@"setMinimizationBehavior:");
+        if ([self.tabBar respondsToSelector:setter]) {
+            // 0 = automatic (shrink on scroll), 1 = never (always expanded)
+            NSInteger value = shrinkOnScroll ? 0 : 1;
+            [self.tabBar setValue:@(value) forKey:@"minimizationBehavior"];
+        }
+    }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
+    if ([keyPath isEqual:UDKeyApolloPostCommentsSnapshots]) {
+        NSData *postSnapshotData = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyApolloPostCommentsSnapshots];
+        if (postSnapshotData) {
+            initializePostSnapshots(postSnapshotData);
+        }
+    }
+}
+
+- (void)dealloc {
+    %orig;
+    [[NSUserDefaults standardUserDefaults] removeObserver:self forKeyPath:UDKeyApolloPostCommentsSnapshots];
+}
+
+%end
+
 // MARK: - Constructor
 %ctor {
     subredditListCache = [NSCache new];
@@ -976,7 +1067,9 @@ static void initializeRandomSources() {
                                     UDKeyTagFilterSubredditOverrides: @{},
                                     UDKeyNotificationBackendURL: @"",
                                     UDKeyNotificationBackendRegistrationToken: @"",
-                                    UDKeyRedditClientSecret: @""};
+                                    UDKeyRedditClientSecret: @"",
+                                    UDKeySearchTabRight: @NO,
+                                    UDKeyTabBarShrinkOnScroll: @NO};
     NSUserDefaults *standardDefaults = [NSUserDefaults standardUserDefaults];
     [standardDefaults registerDefaults:defaultValues];
 
