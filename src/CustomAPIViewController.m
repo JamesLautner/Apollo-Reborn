@@ -629,7 +629,7 @@ typedef NS_ENUM(NSInteger, Tag) {
     switch (section) {
         case SectionBackupRestore: return 2;
         case SectionAPIKeys: return 9; // 7 text fields + Can't sign in? + API key setup guide
-        case SectionGeneral: return 8;
+        case SectionGeneral: return 10;
         case SectionMedia: return (sShowUserAvatars ? 13 : 12) + (sEnableInlineImages ? 0 : -1);
         case SectionSubreddits: return 8;
         case SectionNotificationBackend: return 3; // URL + Registration Token + Test Connection
@@ -1006,6 +1006,18 @@ typedef NS_ENUM(NSInteger, Tag) {
             cell.detailTextLabel.enabled = idleSupported;
             return cell;
         }
+        case 8:
+            return [self switchCellWithIdentifier:@"Cell_Gen_SearchTabRight"
+                                            label:@"Move Search Tab to Right"
+                                           detail:@"Requires restart"
+                                               on:[defaults boolForKey:UDKeySearchTabRight]
+                                           action:@selector(searchTabRightSwitchToggled:)];
+        case 9:
+            return [self switchCellWithIdentifier:@"Cell_Gen_TabBarShrinkOnScroll"
+                                            label:@"Shrink Tab Bar on Scroll"
+                                           detail:@"Requires restart (iOS 26)"
+                                               on:[defaults boolForKey:UDKeyTabBarShrinkOnScroll]
+                                           action:@selector(tabBarShrinkOnScrollSwitchToggled:)];
         default: return [[UITableViewCell alloc] init];
     }
 }
@@ -2280,6 +2292,14 @@ static NSString *const kGroupSuiteName = @"group.com.christianselig.apollo";
     } else {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
     }
+}
+
+- (void)searchTabRightSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeySearchTabRight];
+}
+
+- (void)tabBarShrinkOnScrollSwitchToggled:(UISwitch *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:UDKeyTabBarShrinkOnScroll];
 }
 
 @end

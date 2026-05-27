@@ -78,3 +78,7 @@ static NSString *const UDKeyLinkPreviewBodyMode = @"LinkPreviewBodyMode";
 static NSString *const UDKeyLinkPreviewCommentsMode = @"LinkPreviewCommentsMode";
 static NSString *const UDKeyLinkPreviewCardColor = @"LinkPreviewCardColor";
 static NSString *const ApolloLinkPreviewModeDidChangeNotification = @"ApolloLinkPreviewModeDidChangeNotification";
+
+// iOS 26 Liquid Glass Tab Bar enhancements
+static NSString *const UDKeySearchTabRight = @"SearchTabRight";
+static NSString *const UDKeyTabBarShrinkOnScroll = @"TabBarShrinkOnScroll";
