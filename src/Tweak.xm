@@ -934,27 +934,9 @@ static void initializeRandomSources() {
 
 // MARK: - ApolloTabBarController Hooks
 
-%hook ApolloTabBarController
-
-- (void)viewDidLoad {
-    %orig;
-
-    // Apply tab bar layout tweaks based on user prefs
-    BOOL searchRight   = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchTabRight];
-    BOOL shrinkOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarShrinkOnScroll];
-
-    if (searchRight) {
-        [(id)self apollo_moveSearchTabToEnd];
-    }
-
-    [(id)self apollo_applyMinimizationBehavior:shrinkOnScroll];
-}
-
-// ─── Search tab reordering ────────────────────────────────────────────────────
 // Iterates viewControllers and moves the one whose tabBarItem.title == "Search"
-// to the last position.  Safe to call multiple times (idempotent).
-%new - (void)apollo_moveSearchTabToEnd {
-    UITabBarController *tabBarController = (UITabBarController *)self;
+// to the last position. Safe to call multiple times (idempotent).
+static void ApolloMoveSearchTabToEnd(UITabBarController *tabBarController) {
     NSArray<UIViewController *> *viewControllers = tabBarController.viewControllers;
     if (viewControllers.count < 2) return;
 
@@ -968,7 +950,7 @@ static void initializeRandomSources() {
             return;
         }
     }
-    // If title-based match fails, fall back to class name check
+    // If title-based match fails, fall back to class name check.
     for (NSInteger i = 0; i < (NSInteger)mutableViewControllers.count - 1; i++) {
         UIViewController *vc = mutableViewControllers[i];
         UIViewController *root = vc;
@@ -985,22 +967,35 @@ static void initializeRandomSources() {
     }
 }
 
-// ─── Collapse / always-expanded behaviour ────────────────────────────────────
 // UITabBarMinimizationBehavior (iOS 26+):
-//   0 = automatic  →  collapses on scroll-down, re-expands on scroll-up (Apple Music style)
-//   1 = never      →  tab bar always stays fully expanded
-//
-// Uses KVC so this compiles without the iOS 26 SDK and fails gracefully on older OS.
-%new - (void)apollo_applyMinimizationBehavior:(BOOL)shrinkOnScroll {
-    UITabBarController *tabBarController = (UITabBarController *)self;
+//   0 = automatic -> collapses on scroll-down, re-expands on scroll-up
+//   1 = never     -> tab bar always stays fully expanded
+static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController, BOOL shrinkOnScroll) {
     if (@available(iOS 26, *)) {
         SEL setter = NSSelectorFromString(@"setMinimizationBehavior:");
         if ([tabBarController.tabBar respondsToSelector:setter]) {
-            // 0 = automatic (shrink on scroll), 1 = never (always expanded)
             NSInteger value = shrinkOnScroll ? 0 : 1;
             [tabBarController.tabBar setValue:@(value) forKey:@"minimizationBehavior"];
         }
     }
+}
+
+%hook ApolloTabBarController
+
+- (void)viewDidLoad {
+    %orig;
+
+    UITabBarController *tabBarController = (UITabBarController *)self;
+
+    // Apply tab bar layout tweaks based on user prefs
+    BOOL searchRight   = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchTabRight];
+    BOOL shrinkOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarShrinkOnScroll];
+
+    if (searchRight) {
+        ApolloMoveSearchTabToEnd(tabBarController);
+    }
+
+    ApolloApplyMinimizationBehavior(tabBarController, shrinkOnScroll);
 }
 
 %end
