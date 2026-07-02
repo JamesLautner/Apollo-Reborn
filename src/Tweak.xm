@@ -934,13 +934,20 @@ static void initializeRandomSources() {
 
 // MARK: - ApolloTabBarController Hooks
 
+@interface ApolloTabBarController (ApolloReborn)
+- (void)apollo_moveSearchTabToEnd;
+- (void)apollo_applyMinimizationBehavior:(BOOL)shrinkOnScroll;
+@end
+
 %hook ApolloTabBarController
 
 - (void)viewDidLoad {
     %orig;
 
+    UITabBarController *tabBarController = (UITabBarController *)self;
+
     // Listen for changes to postSnapshots so we can update our internal dictionary
-    [[NSUserDefaults standardUserDefaults] addObserver:self
+    [[NSUserDefaults standardUserDefaults] addObserver:(NSObject *)self
                                             forKeyPath:UDKeyApolloPostCommentsSnapshots
                                                options:NSKeyValueObservingOptionNew
                                                context:NULL];
@@ -950,41 +957,42 @@ static void initializeRandomSources() {
     BOOL shrinkOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarShrinkOnScroll];
 
     if (searchRight) {
-        [self apollo_moveSearchTabToEnd];
+        [tabBarController apollo_moveSearchTabToEnd];
     }
 
-    [self apollo_applyMinimizationBehavior:shrinkOnScroll];
+    [tabBarController apollo_applyMinimizationBehavior:shrinkOnScroll];
 }
 
 // ─── Search tab reordering ────────────────────────────────────────────────────
 // Iterates viewControllers and moves the one whose tabBarItem.title == "Search"
 // to the last position.  Safe to call multiple times (idempotent).
 %new - (void)apollo_moveSearchTabToEnd {
-    NSArray *vcs = self.viewControllers;
-    if (vcs.count < 2) return;
+    UITabBarController *tabBarController = (UITabBarController *)self;
+    NSArray<UIViewController *> *viewControllers = tabBarController.viewControllers;
+    if (viewControllers.count < 2) return;
 
-    NSMutableArray *mutable = [vcs mutableCopy];
-    for (NSInteger i = 0; i < (NSInteger)mutable.count - 1; i++) {
-        UIViewController *vc = mutable[i];
+    NSMutableArray<UIViewController *> *mutableViewControllers = [viewControllers mutableCopy];
+    for (NSInteger i = 0; i < (NSInteger)mutableViewControllers.count - 1; i++) {
+        UIViewController *vc = mutableViewControllers[i];
         if ([vc.tabBarItem.title isEqualToString:@"Search"]) {
-            [mutable removeObjectAtIndex:i];
-            [mutable addObject:vc];
-            self.viewControllers = [mutable copy];
+            [mutableViewControllers removeObjectAtIndex:i];
+            [mutableViewControllers addObject:vc];
+            tabBarController.viewControllers = [mutableViewControllers copy];
             return;
         }
     }
     // If title-based match fails, fall back to class name check
-    for (NSInteger i = 0; i < (NSInteger)mutable.count - 1; i++) {
-        UIViewController *vc = mutable[i];
+    for (NSInteger i = 0; i < (NSInteger)mutableViewControllers.count - 1; i++) {
+        UIViewController *vc = mutableViewControllers[i];
         UIViewController *root = vc;
         if ([root isKindOfClass:[UINavigationController class]]) {
             root = [(UINavigationController *)root topViewController];
         }
         NSString *className = NSStringFromClass([root class]);
         if ([className containsString:@"Search"]) {
-            [mutable removeObjectAtIndex:i];
-            [mutable addObject:vc];
-            self.viewControllers = [mutable copy];
+            [mutableViewControllers removeObjectAtIndex:i];
+            [mutableViewControllers addObject:vc];
+            tabBarController.viewControllers = [mutableViewControllers copy];
             return;
         }
     }
@@ -997,12 +1005,13 @@ static void initializeRandomSources() {
 //
 // Uses KVC so this compiles without the iOS 26 SDK and fails gracefully on older OS.
 %new - (void)apollo_applyMinimizationBehavior:(BOOL)shrinkOnScroll {
+    UITabBarController *tabBarController = (UITabBarController *)self;
     if (@available(iOS 26, *)) {
         SEL setter = NSSelectorFromString(@"setMinimizationBehavior:");
-        if ([self.tabBar respondsToSelector:setter]) {
+        if ([tabBarController.tabBar respondsToSelector:setter]) {
             // 0 = automatic (shrink on scroll), 1 = never (always expanded)
             NSInteger value = shrinkOnScroll ? 0 : 1;
-            [self.tabBar setValue:@(value) forKey:@"minimizationBehavior"];
+            [tabBarController.tabBar setValue:@(value) forKey:@"minimizationBehavior"];
         }
     }
 }
