@@ -934,33 +934,20 @@ static void initializeRandomSources() {
 
 // MARK: - ApolloTabBarController Hooks
 
-@interface ApolloTabBarController (ApolloReborn)
-- (void)apollo_moveSearchTabToEnd;
-- (void)apollo_applyMinimizationBehavior:(BOOL)shrinkOnScroll;
-@end
-
 %hook ApolloTabBarController
 
 - (void)viewDidLoad {
     %orig;
-
-    UITabBarController *tabBarController = (UITabBarController *)self;
-
-    // Listen for changes to postSnapshots so we can update our internal dictionary
-    [[NSUserDefaults standardUserDefaults] addObserver:(NSObject *)self
-                                            forKeyPath:UDKeyApolloPostCommentsSnapshots
-                                               options:NSKeyValueObservingOptionNew
-                                               context:NULL];
 
     // Apply tab bar layout tweaks based on user prefs
     BOOL searchRight   = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchTabRight];
     BOOL shrinkOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarShrinkOnScroll];
 
     if (searchRight) {
-        [tabBarController apollo_moveSearchTabToEnd];
+        [(id)self apollo_moveSearchTabToEnd];
     }
 
-    [tabBarController apollo_applyMinimizationBehavior:shrinkOnScroll];
+    [(id)self apollo_applyMinimizationBehavior:shrinkOnScroll];
 }
 
 // ─── Search tab reordering ────────────────────────────────────────────────────
@@ -1014,20 +1001,6 @@ static void initializeRandomSources() {
             [tabBarController.tabBar setValue:@(value) forKey:@"minimizationBehavior"];
         }
     }
-}
-
-- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
-    if ([keyPath isEqual:UDKeyApolloPostCommentsSnapshots]) {
-        NSData *postSnapshotData = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyApolloPostCommentsSnapshots];
-        if (postSnapshotData) {
-            initializePostSnapshots(postSnapshotData);
-        }
-    }
-}
-
-- (void)dealloc {
-    %orig;
-    [[NSUserDefaults standardUserDefaults] removeObserver:self forKeyPath:UDKeyApolloPostCommentsSnapshots];
 }
 
 %end
