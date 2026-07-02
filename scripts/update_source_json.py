@@ -14,10 +14,25 @@ from urllib.request import Request, urlopen
 
 
 RELEASE_TAG_RE = re.compile(r"^v(?P<apollo>[^_]+)_(?P<tweak>.+)$")
-ASSET_RE = re.compile(
+LEGACY_ASSET_RE = re.compile(
     r"^(?:(?P<prefix>NO-EXTENSIONS_GLASS|NO-EXTENSIONS|GLASS)_)?"
     r"Apollo-(?P<apollo>[^_]+)_Apollo-Reborn-(?P<tweak>.+)\.ipa$"
 )
+# Longest alternatives first so e.g. "GLASSICONS-NOEXTENSIONS" matches as a
+# whole instead of "GLASSICONS" with "-NOEXTENSIONS" left dangling.
+REBORN_ASSET_RE = re.compile(
+    r"^Apollo-Reborn-(?P<tweak>.+?)"
+    r"(?:-(?P<suffix>GLASSICONS-NOEXTENSIONS|GLASS-NOEXTENSIONS|GLASSICONS|NOEXTENSIONS|GLASS))?"
+    r"\.ipa$"
+)
+REBORN_SUFFIX_TO_PREFIX = {
+    None: "",
+    "GLASS": "GLASS",
+    "NOEXTENSIONS": "NO-EXTENSIONS",
+    "GLASS-NOEXTENSIONS": "NO-EXTENSIONS_GLASS",
+    "GLASSICONS": "GLASS-ICONS",
+    "GLASSICONS-NOEXTENSIONS": "NO-EXTENSIONS_GLASS-ICONS",
+}
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -45,6 +60,8 @@ def build_variant_key(prefix: str | None) -> str:
         "GLASS": "glass",
         "NO-EXTENSIONS": "noExtensions",
         "NO-EXTENSIONS_GLASS": "noExtensionsGlass",
+        "GLASS-ICONS": "glassIcons",
+        "NO-EXTENSIONS_GLASS-ICONS": "noExtensionsGlassIcons",
     }
     return mapping[prefix]
 
@@ -55,8 +72,27 @@ def load_existing_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def markdown_to_plain_text(markdown: str) -> str:
+    text = markdown.strip()
+    if not text:
+        return ""
+
+    # AltStore/Feather version history renders descriptions as plain text, so
+    # remove the most visible Markdown syntax while keeping the curated wording.
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"^#{2,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s{2,}[-*]\s+", "  - ", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*]\s+", "- ", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def format_release_notes(body: str, variant_name: str | None = None) -> str:
-    text = body.strip()
+    text = markdown_to_plain_text(body)
     if variant_name:
         return f"{variant_name}\n\n{text}" if text else variant_name
     return text
@@ -73,11 +109,12 @@ def find_matching_asset(release: dict[str, Any], prefix: str | None) -> dict[str
     wanted = prefix or ""
     for asset in release.get("assets", []):
         name = asset.get("name", "")
-        match = ASSET_RE.match(name)
-        if not match:
-            continue
-        asset_prefix = match.group("prefix") or ""
-        if asset_prefix == wanted:
+        reborn_match = REBORN_ASSET_RE.match(name)
+        if reborn_match and REBORN_SUFFIX_TO_PREFIX[reborn_match.group("suffix")] == wanted:
+            return asset
+
+        legacy_match = LEGACY_ASSET_RE.match(name)
+        if legacy_match and (legacy_match.group("prefix") or "") == wanted:
             return asset
     return None
 
@@ -86,6 +123,7 @@ def build_version_entry(
     release: dict[str, Any],
     prefix: str | None,
     variant_name: str | None,
+    build_version: str | None,
 ) -> dict[str, Any] | None:
     parsed = parse_release_tag(release.get("tag_name", ""))
     if not parsed:
@@ -96,16 +134,18 @@ def build_version_entry(
         return None
 
     apollo_version, tweak_version = parsed
-    localized = (
-        f'Apollo version: "v{apollo_version}"\n'
-        f'Apollo-Reborn version: "v{tweak_version}"\n\n'
-        f"{format_release_notes(release.get('body', ''), variant_name)}"
-    ).strip()
     return {
-        "version": apollo_version,
-        "buildVersion": tweak_version,
+        # AltStore's VerifyAppOperation rejects an install when `version` does
+        # not equal the IPA's CFBundleShortVersionString, and (when present)
+        # when `buildVersion` does not equal its CFBundleVersion. The release
+        # pipeline rewrites those fields to the tweak version and the source
+        # config's monotonic build number, so the source must mirror that exact
+        # pair.
+        "version": tweak_version,
+        "buildVersion": build_version,
+        "marketingVersion": tweak_version,
         "date": release.get("published_at"),
-        "localizedDescription": localized,
+        "localizedDescription": format_release_notes(release.get("body", ""), variant_name),
         "downloadURL": asset.get("browser_download_url"),
         "size": asset.get("size"),
     }
@@ -204,6 +244,51 @@ def write_release_manifest(
     output_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def validate_generated_sources(root: Path, config: dict[str, Any]) -> None:
+    manifest_path = root / config["distribution"]["manifestOutput"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    release = manifest.get("release")
+    if not release:
+        raise ValueError("release-manifest.json has no published release")
+
+    tweak_version = release["tweakVersion"]
+    build_version = str(config["app"]["buildVersion"])
+    variants = manifest.get("variants") or {}
+    expected_variant_keys = {build_variant_key(variant["prefix"]) for variant in config["variants"]}
+    missing_variant_keys = sorted(expected_variant_keys - set(variants))
+    if missing_variant_keys:
+        raise ValueError(f"release-manifest.json is missing variants: {', '.join(missing_variant_keys)}")
+
+    for key, entry in variants.items():
+        if not entry.get("sourceURL"):
+            raise ValueError(f"manifest variant {key} is missing sourceURL")
+        if not entry.get("directDownloadURL"):
+            raise ValueError(f"manifest variant {key} is missing directDownloadURL")
+        if not entry.get("assetName"):
+            raise ValueError(f"manifest variant {key} is missing assetName")
+
+    for variant in config["variants"]:
+        output_path = root / variant["output"]
+        data = json.loads(output_path.read_text(encoding="utf-8"))
+        apps = data.get("apps") or []
+        if len(apps) != 1:
+            raise ValueError(f"{variant['output']} must contain exactly one app")
+
+        app = apps[0]
+        if app.get("version") != tweak_version:
+            raise ValueError(f"{variant['output']} version {app.get('version')} != {tweak_version}")
+        if str(app.get("buildVersion")) != build_version:
+            raise ValueError(f"{variant['output']} buildVersion {app.get('buildVersion')} != {build_version}")
+        if app.get("marketingVersion") != tweak_version:
+            raise ValueError(f"{variant['output']} marketingVersion {app.get('marketingVersion')} != {tweak_version}")
+        if not app.get("downloadURL"):
+            raise ValueError(f"{variant['output']} is missing downloadURL")
+        if data.get("featuredApps") != [config["app"]["bundleIdentifier"]]:
+            raise ValueError(f"{variant['output']} has an invalid featuredApps value")
+
+    print(f"Validated generated sources for Apollo-Reborn {tweak_version} build {build_version}")
+
+
 def build_news_entry(
     release: dict[str, Any],
     config: dict[str, Any],
@@ -225,6 +310,34 @@ def build_news_entry(
     }
 
 
+def version_entry_key(entry: dict[str, Any]) -> tuple[Any, ...]:
+    download_url = entry.get("downloadURL")
+    if download_url:
+        return ("downloadURL", download_url)
+    return (
+        "version",
+        entry.get("version"),
+        entry.get("buildVersion"),
+        entry.get("date"),
+    )
+
+
+def merge_version_entries(
+    new_entries: list[dict[str, Any]],
+    existing_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for entry in existing_entries:
+        merged[version_entry_key(entry)] = entry
+    for entry in new_entries:
+        merged[version_entry_key(entry)] = entry
+    return sorted(
+        merged.values(),
+        key=lambda item: item.get("date") or "",
+        reverse=True,
+    )
+
+
 def update_source_json(
     output_path: Path,
     releases: list[dict[str, Any]],
@@ -234,7 +347,10 @@ def update_source_json(
     data = load_existing_json(output_path)
     data.update(config["source"])
     data.update(variant["source"])
-    data["featuredApps"] = data.get("featuredApps", [])
+    # Feature the app on the source's About page. bundleIdentifier is required in
+    # config, so we always override any stale featuredApps carried over from a
+    # previously generated source file.
+    data["featuredApps"] = [config["app"]["bundleIdentifier"]]
     if "apps" not in data or not data["apps"]:
         data["apps"] = [{}]
 
@@ -242,9 +358,12 @@ def update_source_json(
     app.update(config["app"])
     app.update(variant["app"])
 
-    seen: set[tuple[str, str]] = set()
+    build_version = config["app"].get("buildVersion")
     versions: list[dict[str, Any]] = []
     news: list[dict[str, Any]] = []
+    existing_versions = app.get("versions") or []
+    if not isinstance(existing_versions, list):
+        existing_versions = []
 
     sorted_releases = sorted(
         releases,
@@ -252,27 +371,31 @@ def update_source_json(
     )
 
     for release in reversed(sorted_releases):
-        entry = build_version_entry(release, variant["prefix"], variant.get("notesLabel"))
+        entry = build_version_entry(
+            release, variant["prefix"], variant.get("notesLabel"), build_version
+        )
         if not entry:
             continue
-        key = (entry["version"], entry["buildVersion"])
-        if key in seen:
-            continue
-        seen.add(key)
-        versions.append(entry)
+        # The source config only knows the current IPA build number. Generate the
+        # newest release entry, then preserve older entries already in the source
+        # so their historical buildVersion values remain installable.
+        if not versions:
+            versions.append(entry)
         news.append(build_news_entry(release, config, variant.get("newsLabel")))
 
-    app["versions"] = versions
-    if versions:
-        latest = versions[0]
+    merged_versions = merge_version_entries(versions, existing_versions)
+    app["versions"] = merged_versions
+    if merged_versions:
+        latest = merged_versions[0]
         app["version"] = latest["version"]
         app["buildVersion"] = latest["buildVersion"]
+        app["marketingVersion"] = latest["marketingVersion"]
         app["versionDate"] = latest["date"]
         app["versionDescription"] = latest["localizedDescription"]
         app["downloadURL"] = latest["downloadURL"]
         app["size"] = latest["size"]
 
-    data["news"] = sorted(news, key=lambda item: item.get("date") or "", reverse=True)
+    data["news"] = sorted(news, key=lambda item: item.get("date") or "")
 
     output_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -310,6 +433,8 @@ def main() -> int:
     manifest_path = root / config["distribution"]["manifestOutput"]
     write_release_manifest(manifest_path, releases, config)
     print(f"Updated {manifest_path}")
+
+    validate_generated_sources(root, config)
 
     return 0
 

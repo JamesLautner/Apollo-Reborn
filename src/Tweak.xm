@@ -1,21 +1,32 @@
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/utsname.h>
 #import <Security/Security.h>
 #import <StoreKit/StoreKit.h>
+#import <AuthenticationServices/AuthenticationServices.h>
 
 #import "fishhook.h"
 #import "ApolloCommon.h"
 #import "ApolloRedditMediaUpload.h"
+#import "ApolloDeletedCommentsData.h"
 #import "ApolloImageUploadHost.h"
+#import "ApolloImgChestUpload.h"
 #import "ApolloNotificationBackend.h"
+#import "ApolloPushNotifications.h"
 #import "ApolloState.h"
 #import "Tweak.h"
 #import "CustomAPIViewController.h"
 #import "UserDefaultConstants.h"
+#import "ApolloPostFilterStore.h"
 #import "Defaults.h"
 #import "ApolloMarkdownToolbarGif.h"
+#import "ApolloWebAuthViewController.h"
+#import "ApolloWebJSON.h"
+#import "ApolloWebSessionStore.h"
+#import "ApolloWebSessionLoginViewController.h"
+#import "ApolloAccountCredentials.h"
 
 // MARK: - Sideload Fixes
 
@@ -61,9 +72,108 @@ static NSData *OverrideDataForAccount(NSString *account) {
     return [value dataUsingEncoding:NSUTF8StringEncoding];
 }
 
+#if APOLLO_SIM_BUILD
+// MARK: - Simulator keychain shim (Valet virtualization)
+//
+// Why this exists: Apollo's AccountManager loads logged-in accounts on launch from the
+// keychain via Valet, and the *entire* load is gated behind `Valet.canAccessKeychain()`.
+// In the simulator the app is ad-hoc signed with NO `application-identifier` /
+// `keychain-access-groups` entitlement, so securityd has no keychain access group to file
+// items under and rejects every Sec* call with errSecMissingEntitlement (-34018) — even
+// after we strip kSecAttrAccessGroup. canAccessKeychain returns NO, the load is skipped, and
+// AccountManager prunes every account. Adding the entitlement is a dead end (iOS-26's
+// simulator refuses to launch an ad-hoc app carrying it; there's no profile to back it).
+//
+// Fix: virtualize the keychain for Valet's queries with a plist-backed store in the app
+// container — a store the sandboxed sim build CAN read and write. add/copy/update/delete all
+// hit this store instead of the (broken) real keychain, so canAccessKeychain's canary
+// round-trips succeed and account reads/writes work. The store is seeded from a settings
+// backup: `backupSettings` captures Apollo's real Valet keychain items on a device, and
+// `scripts/run-in-sim.sh` stages them at ApolloKeychainSeed.plist for import here, so a
+// restored backup signs straight in. Entirely sim-only; the device build is untouched and
+// still uses the real keychain.
+
+// The seed file run-in-sim.sh drops in from a backup's keychain.plist: an array of
+// { service, account, data } dictionaries (Apollo's own keychain items, captured on device).
+static NSString *SimKeychainSeedPath(void) {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"]
+                stringByAppendingPathComponent:@"ApolloKeychainSeed.plist"];
+}
+
+// The live virtual keychain: { "service\naccount" : valueData }, persisted to disk so account
+// state (and Apollo's own writes) survive relaunch within the simulator.
+static NSString *SimKeychainStorePath(void) {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"]
+                stringByAppendingPathComponent:@"ApolloSimKeychain.plist"];
+}
+
+static NSString *SimKeychainKey(NSString *service, NSString *account) {
+    return [NSString stringWithFormat:@"%@\n%@", service ?: @"", account ?: @""];
+}
+
+static NSMutableDictionary<NSString *, NSData *> *SimKeychainStore(void) {
+    static NSMutableDictionary *store;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSDictionary *disk = [NSDictionary dictionaryWithContentsOfFile:SimKeychainStorePath()];
+        store = disk ? [disk mutableCopy] : [NSMutableDictionary dictionary];
+
+        // One-time seed import from the staged backup keychain items.
+        NSArray *seed = [NSArray arrayWithContentsOfFile:SimKeychainSeedPath()];
+        if (seed.count) {
+            NSUInteger imported = 0;
+            for (NSDictionary *item in seed) {
+                NSString *svc = item[@"service"];
+                NSString *acct = item[@"account"];
+                NSData *data = item[@"data"];
+                if ([data isKindOfClass:[NSData class]] && (svc || acct)) {
+                    store[SimKeychainKey(svc, acct)] = data;
+                    imported++;
+                }
+            }
+            // Consume the seed so Apollo's own writes own the store from here on.
+            [[NSFileManager defaultManager] removeItemAtPath:SimKeychainSeedPath() error:nil];
+            [store writeToFile:SimKeychainStorePath() atomically:YES];
+            ApolloLog(@"[SimKeychain] seeded %lu item(s) from backup", (unsigned long)imported);
+        }
+    });
+    return store;
+}
+
+static void SimKeychainPersist(void) {
+    [SimKeychainStore() writeToFile:SimKeychainStorePath() atomically:YES];
+}
+
+// Build the SecItemCopyMatching result for stored data, honoring the query's return flags.
+static OSStatus SimKeychainServe(NSDictionary *q, NSData *data, CFTypeRef *result) {
+    if (!result) return errSecSuccess;
+    if (q[(__bridge id)kSecReturnAttributes]) {
+        NSMutableDictionary *attrs = [NSMutableDictionary dictionary];
+        if (q[(__bridge id)kSecAttrAccount]) attrs[(__bridge id)kSecAttrAccount] = q[(__bridge id)kSecAttrAccount];
+        if (q[(__bridge id)kSecAttrService]) attrs[(__bridge id)kSecAttrService] = q[(__bridge id)kSecAttrService];
+        if (q[(__bridge id)kSecReturnData]) attrs[(__bridge id)kSecValueData] = data;
+        *result = (__bridge_retained CFTypeRef)attrs;
+    } else {
+        *result = (__bridge_retained CFTypeRef)data;
+    }
+    return errSecSuccess;
+}
+#endif
+
 static void *SecItemAdd_orig;
 static OSStatus SecItemAdd_replacement(CFDictionaryRef query, CFTypeRef *result) {
     NSDictionary *strippedQuery = stripGroupAccessAttr(query);
+#if APOLLO_SIM_BUILD
+    if (IsValetQuery(strippedQuery)) {
+        id value = strippedQuery[(__bridge id)kSecValueData];
+        if ([value isKindOfClass:[NSData class]]) {
+            SimKeychainStore()[SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount])] = value;
+            SimKeychainPersist();
+            if (result) SimKeychainServe(strippedQuery, value, result);
+        }
+        return errSecSuccess;
+    }
+#endif
     return ((OSStatus (*)(CFDictionaryRef, CFTypeRef *))SecItemAdd_orig)((__bridge CFDictionaryRef)strippedQuery, result);
 }
 
@@ -88,6 +198,14 @@ static OSStatus SecItemCopyMatching_replacement(CFDictionaryRef query, CFTypeRef
         return errSecSuccess;
     }
 
+#if APOLLO_SIM_BUILD
+    if (IsValetQuery(strippedQuery)) {
+        NSData *data = SimKeychainStore()[SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount])];
+        if (data) return SimKeychainServe(strippedQuery, data, result);
+        return errSecItemNotFound;
+    }
+#endif
+
     return ((OSStatus (*)(CFDictionaryRef, CFTypeRef *))SecItemCopyMatching_orig)((__bridge CFDictionaryRef)strippedQuery, result);
 }
 
@@ -100,8 +218,37 @@ static OSStatus SecItemUpdate_replacement(CFDictionaryRef query, CFDictionaryRef
         return errSecSuccess;
     }
 
+#if APOLLO_SIM_BUILD
+    if (IsValetQuery(strippedQuery)) {
+        NSString *key = SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount]);
+        id value = ((__bridge NSDictionary *)attributesToUpdate)[(__bridge id)kSecValueData];
+        if ([value isKindOfClass:[NSData class]]) {
+            SimKeychainStore()[key] = value;
+            SimKeychainPersist();
+            return errSecSuccess;
+        }
+        return SimKeychainStore()[key] ? errSecSuccess : errSecItemNotFound;
+    }
+#endif
+
     return ((OSStatus (*)(CFDictionaryRef, CFDictionaryRef))SecItemUpdate_orig)((__bridge CFDictionaryRef)strippedQuery, attributesToUpdate);
 }
+
+#if APOLLO_SIM_BUILD
+static void *SecItemDelete_orig;
+static OSStatus SecItemDelete_replacement(CFDictionaryRef query) {
+    NSDictionary *strippedQuery = stripGroupAccessAttr(query);
+    if (IsValetQuery(strippedQuery)) {
+        NSString *key = SimKeychainKey(strippedQuery[(__bridge id)kSecAttrService], strippedQuery[(__bridge id)kSecAttrAccount]);
+        if (SimKeychainStore()[key]) {
+            [SimKeychainStore() removeObjectForKey:key];
+            SimKeychainPersist();
+        }
+        return errSecSuccess;
+    }
+    return ((OSStatus (*)(CFDictionaryRef))SecItemDelete_orig)((__bridge CFDictionaryRef)strippedQuery);
+}
+#endif
 
 // --- Device detection (for Pixel Pals and Dynamic Island behaviour) ---
 // Apollo's device model mapper (sub_1007a3cdc) only recognizes models up to iPhone 14 Pro Max.
@@ -170,16 +317,145 @@ static NSArray *const blockedUrls = @[
 
 // Cache storing subreddit list source URLs -> response body
 static NSCache<NSString *, NSString *> *subredditListCache;
-// Replace Reddit API client ID
+// Replace Reddit API client ID. Resolved per-account (see
+// ApolloAccountCredentials.{h,m}): a pending add-account choice, else the
+// active account's stored override, else the global default — instead of
+// unconditionally forcing the single global client id/redirect URI onto every
+// account, which broke a second account's login/refresh under a different key.
 %hook RDKOAuthCredential
 
+// Fall back to %orig (the credential's REAL stored value) when nothing is
+// actually configured for this account. Unconditionally forcing
+// ApolloEffectiveRedditClientId() here used to silently clobber that real
+// value with an empty string whenever sRedditClientId was unset (it has no
+// hardcoded fallback constant, unlike the redirect URI below), breaking token
+// refresh for exactly that account with a blank, unmatchable client_id.
 - (NSString *)clientIdentifier {
-    return sRedditClientId;
+    NSString *effective = ApolloEffectiveRedditClientId();
+    return effective.length > 0 ? effective : %orig;
 }
 
 - (NSURL *)redirectURI {
-    NSString *customURI = [sRedirectURI length] > 0 ? sRedirectURI : defaultRedirectURI;
-    return [NSURL URLWithString:customURI];
+    NSString *effective = ApolloEffectiveRedirectURI();
+    return effective.length > 0 ? [NSURL URLWithString:effective] : %orig;
+}
+
+%end
+
+// RDKClient always authenticates Reddit's token endpoint (api/v1/access_token —
+// used for both the authorization_code exchange and refresh_token grants) via HTTP
+// Basic Auth with an empty password (-[RDKClient setAuthorizationCredential:],
+// -[RDKClient refreshAccessTokenWithCompletion:completion:], and
+// -[RDKClient retrieveAccessTokenForApplicationOnlyWithCompletion:] all call
+// setAuthorizationHeaderFieldWithUsername:password:@"" directly on the request
+// serializer). That's correct for Reddit "installed app"/public OAuth clients, but
+// "Web app" (confidential) clients require the real client_secret as the password —
+// Reddit 401s every token request otherwise. Hooking at this single low-level call
+// site (rather than each RDKClient method) catches all of them uniformly and leaves
+// the separate "bearer <token>" Authorization header (used for every other Reddit
+// API call once signed in) completely untouched, since that's set via
+// setValue:forHTTPHeaderField: instead.
+//
+// The secret is resolved by reverse-lookup on the client_id presented as
+// `username` (ApolloSecretForClientId — checks every stored per-account entry,
+// then the global default), NOT by "whichever account is active right now".
+// This matters because token *refresh* for a backgrounded/non-active account's
+// session can still land here, and it must authenticate with THAT account's
+// secret, not the foregrounded account's.
+%hook AFHTTPRequestSerializer
+
+- (void)setAuthorizationHeaderFieldWithUsername:(NSString *)username password:(NSString *)password {
+    if (password.length == 0) {
+        NSString *secret = ApolloSecretForClientId(username);
+        if (secret.length > 0) {
+            %orig(username, secret);
+            return;
+        }
+    }
+    %orig;
+}
+
+%end
+
+static const char kARScheme     = '\0';
+static const char kARAuthURL    = '\0';
+static const char kARCompletion = '\0';
+
+// Replace ASWebAuthenticationSession with a WKWebView-based flow for all
+// Reddit OAuth sign-ins. WKNavigationDelegate fires decidePolicyForNavigationAction
+// for every URL before iOS URL routing, so the callback can be intercepted
+// regardless of whether the redirect URI scheme is registered in CFBundleURLTypes.
+%hook ASWebAuthenticationSession
+
+- (instancetype)initWithURL:(NSURL *)URL
+        callbackURLScheme:(NSString *)callbackURLScheme
+        completionHandler:(void (^)(NSURL *, NSError *))completionHandler {
+    id result = %orig;
+    id target = result ?: self;
+    objc_setAssociatedObject(target, &kARScheme,     callbackURLScheme, OBJC_ASSOCIATION_COPY);
+    objc_setAssociatedObject(target, &kARAuthURL,    URL,               OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(target, &kARCompletion, completionHandler, OBJC_ASSOCIATION_COPY);
+    return result;
+}
+
+- (BOOL)start {
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseCustomOAuthSignIn]) {
+        return %orig;
+    }
+
+    NSString *callbackScheme = objc_getAssociatedObject(self, &kARScheme);
+    NSURL *authURL            = objc_getAssociatedObject(self, &kARAuthURL);
+    void (^completion)(NSURL *, NSError *) = objc_getAssociatedObject(self, &kARCompletion);
+
+    if (!authURL || !completion) {
+        ApolloLog(@"[WebAuth] missing authURL or completion — falling back to %%orig");
+        return %orig;
+    }
+
+    // Prefer the full redirect_uri from the auth URL (set by our RDKOAuthCredential
+    // hook) so we can match the *entire* callback URL — scheme, host, and path —
+    // rather than just the scheme. This is required for http/https redirect URIs
+    // (Reddit "Web app" API clients), where every Reddit page navigation shares the
+    // same scheme and scheme-only matching would fire on the wrong navigation.
+    // Falls back to callbackURLScheme (as a bare "scheme://") if redirect_uri is
+    // missing from the auth URL for some reason.
+    NSString *interceptRedirectURI = callbackScheme.length ? [callbackScheme stringByAppendingString:@"://"] : nil;
+    for (NSURLQueryItem *item in [NSURLComponents componentsWithURL:authURL resolvingAgainstBaseURL:NO].queryItems) {
+        if ([item.name isEqualToString:@"redirect_uri"]) {
+            if (item.value.length) interceptRedirectURI = item.value;
+            break;
+        }
+    }
+
+    ApolloLog(@"[WebAuth] using WKWebView, intercepting redirectURI=%@", interceptRedirectURI);
+
+    // Use Apollo's own presentationContextProvider — it's set before start is called
+    // and returns the correct window. start is already on the main queue.
+    id<ASWebAuthenticationPresentationContextProviding> provider = [self presentationContextProvider];
+    UIWindow *window = [provider presentationAnchorForWebAuthenticationSession:self];
+
+    if (!window) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState == UISceneActivationStateForegroundActive
+                    && [scene isKindOfClass:[UIWindowScene class]]) {
+                window = ((UIWindowScene *)scene).keyWindow ?: ((UIWindowScene *)scene).windows.firstObject;
+                break;
+            }
+        }
+    }
+
+    ApolloLog(@"[WebAuth] presenting from window=%@", window);
+
+    ApolloWebAuthViewController *authVC = [[ApolloWebAuthViewController alloc]
+        initWithURL:authURL redirectURI:interceptRedirectURI completionHandler:completion];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:authVC];
+    nav.modalPresentationStyle = UIModalPresentationFormSheet;
+
+    UIViewController *top = window.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    [top presentViewController:nav animated:YES completion:nil];
+
+    return YES;
 }
 
 %end
@@ -367,8 +643,26 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 
 %hook NSURLSession
 
+// Async image loaders (PINRemoteImage etc.) send no User-Agent on imgchest
+// requests, which its CDN rejects with 403; add one across every
+// task-creation entry point.
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request {
+    NSURLRequest *ua = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    return ua ? %orig(ua) : %orig;
+}
+
+- (NSURLSessionDownloadTask *)downloadTaskWithRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURL *, NSURLResponse *, NSError *))completionHandler {
+    NSURLRequest *ua = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    return ua ? %orig(ua, completionHandler) : %orig;
+}
+
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:");
+    ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:");
+    ApolloDeletedCommentsInstallDelegateTransformerIfNeeded((NSURLSession *)self, request);
+
+    NSURLRequest *imgChestUARequest = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    if (imgChestUARequest) return %orig(imgChestUARequest);
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -474,6 +768,10 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 // Imgur Delete and album creation
 - (NSURLSessionDataTask*)dataTaskWithRequest:(NSURLRequest*)request completionHandler:(void (^)(NSData*, NSURLResponse*, NSError*))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession dataTaskWithRequest:completionHandler:");
+    ApolloDeletedCommentsHandleRequestObservation(request, @"dataTaskWithRequest:completionHandler:");
+
+    NSURLRequest *imgChestUARequest = ApolloImgChestRequestByAddingUserAgentIfNeeded(request);
+    if (imgChestUARequest) return %orig(imgChestUARequest, completionHandler);
 
     NSURLRequest *redditMediaSubmitRequest = ApolloRedditMaybeRewriteSubmitRequest(request);
     if (redditMediaSubmitRequest) {
@@ -509,6 +807,29 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             completionHandler(redditAlbumResponseData, fakeHTTPResponse, nil);
         };
         return %orig(ApolloLocalFastFailRequest(@"apollo-reddit-gallery-album"), wrappedHandler);
+    }
+
+    // ImgChest host: combine the member uploads into one multi-image ImgChest
+    // post and answer the Imgur album creation with its link.
+    ApolloImgChestAlbumResponder imgChestAlbumResponder = nil;
+    if (sImageUploadProvider == ImageUploadProviderImgChest) {
+        imgChestAlbumResponder = ApolloImgChestAlbumCreationResponderForRequest(request);
+    }
+    if (completionHandler && imgChestAlbumResponder) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            imgChestAlbumResponder(completionHandler);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-imgchest-album"), wrappedHandler);
+    }
+
+    // Manage Uploads (issue #414): deletes of uploads this tweak created are
+    // routed to their real provider (ImgChest server-side delete; Reddit and
+    // merged interim entries acknowledged so they leave Apollo's list).
+    if (completionHandler && ApolloUploadRegistryShouldInterceptDelete(request)) {
+        void (^wrappedHandler)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *data, __unused NSURLResponse *response, __unused NSError *error) {
+            ApolloUploadRegistryHandleImgurDelete(request, completionHandler);
+        };
+        return %orig(ApolloLocalFastFailRequest(@"apollo-upload-registry-delete"), wrappedHandler);
     }
 
     if ([host isEqualToString:@"imgur-apiv3.p.rapidapi.com"] && [path hasPrefix:@"/3/album"]) {
@@ -559,11 +880,14 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
         };
         return %orig(modifiedRequest, newCompletionHandler);
     }
-    return %orig;
+    return %orig(request, ApolloDeletedCommentsMaybeWrapCompletion(request, completionHandler));
 }
 
 // "Unproxy" Imgur requests
 - (NSURLSessionDataTask *)dataTaskWithURL:(NSURL *)url completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
+    NSURLRequest *observeRequest = url ? [NSURLRequest requestWithURL:url] : nil;
+    ApolloDeletedCommentsHandleRequestObservation(observeRequest, @"dataTaskWithURL:completionHandler:");
+
     if ([url.host isEqualToString:@"apollogur.download"]) {
         NSString *imageID = [url.lastPathComponent stringByDeletingPathExtension];
 
@@ -644,7 +968,7 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             return %orig(modifiedURL, completionHandler);
         }
     }
-    return %orig;
+    return %orig(url, ApolloDeletedCommentsMaybeWrapCompletion(observeRequest, completionHandler));
 }
 
 %new
@@ -743,9 +1067,40 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
             [self setValue:mutableRequest forKey:@"_currentRequest"];
         }
     } else if ([requestURL.host isEqualToString:@"oauth.reddit.com"] || [requestURL.host isEqualToString:@"www.reddit.com"]) {
+        // Web JSON spike: when the flag is on, whitelisted listing reads are
+        // re-pointed at cookie-authenticated www.reddit.com/...json instead of
+        // the oauth host (see ApolloWebJSON.m). Returns nil when off/not
+        // applicable, leaving the existing oauth behavior untouched.
+        NSURLRequest *webJSONRequest = ApolloWebJSONRewriteRequest(request);
+        if (webJSONRequest) {
+            [self setValue:webJSONRequest forKey:@"_originalRequest"];
+            [self setValue:webJSONRequest forKey:@"_currentRequest"];
+            %orig;
+            return;
+        }
+
         NSMutableURLRequest *mutableRequest = [request mutableCopy];
         NSString *customUA = [sUserAgent length] > 0 ? sUserAgent : defaultUserAgent;
         [mutableRequest setValue:customUA forHTTPHeaderField:@"User-Agent"];
+
+        // Reddit now returns 403 for unauthenticated www.reddit.com/api/info.json
+        // requests, which Apollo issues natively to populate the Recently Read list
+        // (no Authorization header, browser UA). Reroute those to the authenticated
+        // oauth.reddit.com host with the captured bearer token so the list loads.
+        if ([requestURL.host isEqualToString:@"www.reddit.com"]
+            && [requestURL.path containsString:@"/api/info"]
+            && sLatestRedditBearerToken.length > 0
+            && [[request valueForHTTPHeaderField:@"Authorization"] length] == 0) {
+            NSURLComponents *components = [NSURLComponents componentsWithURL:requestURL resolvingAgainstBaseURL:NO];
+            components.host = @"oauth.reddit.com";
+            NSURL *oauthURL = components.URL;
+            if (oauthURL) {
+                [mutableRequest setURL:oauthURL];
+                [mutableRequest setValue:[@"Bearer " stringByAppendingString:sLatestRedditBearerToken] forHTTPHeaderField:@"Authorization"];
+                ApolloLog(@"[RecentlyRead] Rerouted unauthenticated info.json to oauth.reddit.com");
+            }
+        }
+
         [self setValue:mutableRequest forKey:@"_originalRequest"];
         [self setValue:mutableRequest forKey:@"_currentRequest"];
     } else if (sProxyImgurDDG
@@ -769,6 +1124,20 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     %orig;
 }
 
+// Response-side observation for Web JSON session-expiry detection. Every task's
+// completion passes through here; ApolloWebJSONNoteResponse only reacts when Web
+// JSON mode is on and a cookie-authed www.reddit.com request came back as
+// Reddit's 403 HTML block page (signalling the harvested cookie expired). It's a
+// cheap predicate when the flag is off, so this is safe on the hot path.
+- (void)_onqueue_didFinishWithError:(id)error {
+    if (sWebJSONEnabled) {
+        NSURLSessionTask *task = (NSURLSessionTask *)self;
+        NSURLRequest *finished = task.currentRequest ?: task.originalRequest;
+        ApolloWebJSONNoteResponse(finished, task.response);
+    }
+    %orig;
+}
+
 %end
 
 // Unlock "Artificial Superintelligence" Pixel Pal (normally requires Carrot Weather app installed)
@@ -789,6 +1158,51 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
 // On devices with different safe area insets, compute the correct DI Y position.
 // The gap between DI bottom and safe area scales proportionally with safeTop.
 // Y is floored to the nearest half-pixel to match the baseline's sub-pixel alignment.
+//
+// --- Pixel Pals freeze guard (issue #305) ---
+// Tapping the Dynamic Island Pixel Pals area (pixelPalTappedWithTapGestureRecognizer:)
+// or a pal barking for attention (dogBarkedWithNotification:) both present the
+// PixelPalOverlayViewController on the *topmost* currently-presented view
+// controller — Apollo's presenter (sub_1002cd660) walks rootViewController's
+// presentedViewController chain to the end and presents there. When a fullscreen
+// media viewer or the in-app web browser is open — especially mid-interactive
+// swipe-dismiss — that races the in-flight transition: the overlay is presented
+// onto a controller that is being torn down, leaving an orphaned fullscreen
+// transition view that swallows every touch. The app looks frozen (the video's
+// audio keeps playing underneath) and has to be force-quit.
+//
+// Fix: refuse to open the Pixel Pals menu whenever any non-Pixel-Pals modal is
+// presented, or any present/dismiss transition is in flight, anywhere in the
+// window's view-controller chain. This matches the reporters' own diagnosis
+// ("preventing the pixel pal menu from opening with any media or website open
+// should fix everything") and is a strict superset of Apollo's intended
+// behaviour (the menu is already meant to be unreachable while media is open).
+static BOOL ApolloPixelPalsBlockedByModal(UIWindow *window) {
+    Class overlayCls = objc_getClass("_TtC6Apollo29PixelPalOverlayViewController");
+    UIViewController *vc = window.rootViewController;
+    while (vc) {
+        UIViewController *presented = vc.presentedViewController;
+        if (!presented) break;  // nothing modally presented here — safe to open
+        // A modal present/dismiss is animating at this level — the mid-swipe media
+        // dismiss in the repro. We only consult the coordinator once we know a modal
+        // is actually presented: on iOS 26 the transitionCoordinator getter recurses
+        // into child view controllers, so the root tab controller reports a live
+        // coordinator during ordinary feed push/pop too, and checking it
+        // unconditionally would wrongly swallow taps during normal navigation.
+        if (vc.transitionCoordinator) return YES;
+        // The overlay already being up is harmless — Apollo no-ops a re-tap; descend
+        // past it and keep checking the rest of the chain.
+        if (overlayCls && [presented isKindOfClass:overlayCls]) {
+            vc = presented;
+            continue;
+        }
+        // Some other modal (media viewer, in-app web browser, share/settings sheet)
+        // is on top — presenting the menu over it is exactly what wedges UIKit.
+        return YES;
+    }
+    return NO;
+}
+
 %hook _TtC6Apollo15ThemeableWindow
 
 - (void)layoutSubviews {
@@ -867,6 +1281,25 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     view.frame = f;
 }
 
+// Suppress the Pixel Pals menu while media / a website / any modal is open or
+// mid-transition — opening it then races UIKit and freezes the app (issue #305).
+- (void)pixelPalTappedWithTapGestureRecognizer:(id)recognizer {
+    if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
+        ApolloLog(@"[PixelPals] Tap ignored — a modal is open/transitioning (issue #305 freeze guard)");
+        return;
+    }
+    %orig;
+}
+
+// Same guard for the auto-open path when a pal barks for attention.
+- (void)dogBarkedWithNotification:(id)notification {
+    if (ApolloPixelPalsBlockedByModal((UIWindow *)self)) {
+        ApolloLog(@"[PixelPals] Bark menu suppressed — a modal is open/transitioning (issue #305 freeze guard)");
+        return;
+    }
+    %orig;
+}
+
 %end
 
 // Sideloaded builds have no App Store receipt, so SKReceiptRefreshRequest always
@@ -880,6 +1313,80 @@ static NSURLRequest *ApolloLocalFastFailRequest(NSString *path) {
     if ([delegate respondsToSelector:@selector(requestDidFinish:)]) {
         [delegate requestDidFinish:self];
     }
+}
+%end
+
+// Sideloaded builds signed without a paid Apple Developer team never receive an
+// `aps-environment` entitlement, so APNs registration always fails with
+// NSCocoaErrorDomain 3000 ("no valid 'aps-environment' entitlement string found
+// for application"). Apollo surfaces that raw error as an alarming "Error
+// Loading Notifications — contact developer" alert — telling users to contact a
+// developer about something no developer can fix at runtime.
+//
+// Push, watchers, and inbox alerts genuinely can't be delivered without the
+// entitlement, so faking a successful registration would only mislead users
+// into thinking notifications work. Instead we (1) swallow *only* this specific,
+// unfixable error here so the scary alert never appears, and (2) replace the
+// Notifications settings screen with a clear explanation (see the
+// NotificationsViewController hook below). Genuine, transient failures (offline,
+// rate limiting, …) fall through to %orig and keep their original error so real
+// problems still surface.
+%hook _TtC6Apollo11AppDelegate
+- (void)application:(UIApplication *)application didFailToRegisterForRemoteNotificationsWithError:(NSError *)error {
+    if (ApolloErrorIsMissingPushEntitlement(error)) {
+        ApolloLog(@"[Push] Missing aps-environment entitlement (free-account sideload) — push can never be delivered on this build. Suppressing the misleading registration error; the Notifications screen explains why instead.");
+        return;
+    }
+    %orig;
+}
+%end
+
+// On a build that can never receive push (a free-account sideload with no
+// `aps-environment` entitlement), Apollo's Notifications settings are a dead end:
+// every toggle ends in the suppressed registration error above, and nothing the
+// user enables can ever deliver. Showing the working-looking controls would give
+// folks false hope, so we replace the screen's contents with a clear,
+// non-interactive explanation. Builds that *can* receive push (a paid-account
+// sideload, or the App Store binary on a jailbreak) are detected via the
+// entitlement and left completely untouched.
+//
+// `_TtC6Apollo27NotificationsViewController` is only forward-declared here, so
+// the install logic lives in a C helper taking a plain UIViewController*.
+static void ApolloInstallNotificationsUnavailableOverlay(UIViewController *controller) {
+    if (ApolloPushNotificationsSupported()) {
+        return;
+    }
+    // 'APNU' — unique enough to find our overlay again without a second add.
+    static const NSInteger kApolloNotificationsUnavailableTag = 0x41504E55;
+    UIView *root = controller.view;
+    if (!root || [root viewWithTag:kApolloNotificationsUnavailableTag]) {
+        return;
+    }
+    UIView *overlay = ApolloMakeNotificationsUnavailableView();
+    if (!overlay) {
+        return;
+    }
+    overlay.tag = kApolloNotificationsUnavailableTag;
+    overlay.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addSubview:overlay];
+    [root bringSubviewToFront:overlay];
+    [NSLayoutConstraint activateConstraints:@[
+        [overlay.topAnchor constraintEqualToAnchor:root.topAnchor],
+        [overlay.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+        [overlay.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+        [overlay.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+    ]];
+    ApolloLog(@"[Push] No aps-environment entitlement on this signing — replacing the Notifications screen with the 'unavailable' explanation.");
+}
+
+%hook _TtC6Apollo27NotificationsViewController
+- (void)viewDidLoad {
+    %orig;
+    ApolloInstallNotificationsUnavailableOverlay((UIViewController *)self);
+}
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    ApolloInstallNotificationsUnavailableOverlay((UIViewController *)self);
 }
 %end
 
@@ -932,7 +1439,7 @@ static void initializeRandomSources() {
     });
 }
 
-// MARK: - ApolloTabBarController Hooks
+// MARK: - UITabBarController Hooks
 
 // Iterates viewControllers and moves the one whose tabBarItem.title == "Search"
 // to the last position. Safe to call multiple times (idempotent).
@@ -967,35 +1474,23 @@ static void ApolloMoveSearchTabToEnd(UITabBarController *tabBarController) {
     }
 }
 
-// UITabBarMinimizationBehavior (iOS 26+):
-//   0 = automatic -> collapses on scroll-down, re-expands on scroll-up
-//   1 = never     -> tab bar always stays fully expanded
-static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController, BOOL shrinkOnScroll) {
-    if (@available(iOS 26, *)) {
-        SEL setter = NSSelectorFromString(@"setMinimizationBehavior:");
-        if ([tabBarController.tabBar respondsToSelector:setter]) {
-            NSInteger value = shrinkOnScroll ? 0 : 1;
-            [tabBarController.tabBar setValue:@(value) forKey:@"minimizationBehavior"];
-        }
-    }
-}
-
-%hook ApolloTabBarController
-
-- (void)viewDidLoad {
-    %orig;
-
-    UITabBarController *tabBarController = (UITabBarController *)self;
-
-    // Apply tab bar layout tweaks based on user prefs
-    BOOL searchRight   = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchTabRight];
-    BOOL shrinkOnScroll = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTabBarShrinkOnScroll];
-
+static void ApolloApplyTabBarLayoutPreferences(UITabBarController *tabBarController) {
+    BOOL searchRight = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySearchTabRight];
     if (searchRight) {
         ApolloMoveSearchTabToEnd(tabBarController);
     }
+}
 
-    ApolloApplyMinimizationBehavior(tabBarController, shrinkOnScroll);
+%hook UITabBarController
+
+- (void)viewDidLoad {
+    %orig;
+    ApolloApplyTabBarLayoutPreferences(self);
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    %orig(animated);
+    ApolloApplyTabBarLayoutPreferences(self);
 }
 
 %end
@@ -1012,23 +1507,39 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
                                     UDKeyRandNsfwSubredditsSource: @"",
                                     UDKeyTrendingSubredditsSource: defaultTrendingSubredditsSource,
                                     UDKeyReadPostMaxCount: @0,
+                                    UDKeySubredditListEnhancements: @YES,
                                     UDKeyModernSubredditDividers: @YES,
+                                    UDKeyShowDeletedComments: @NO,
+                                    UDKeyTapToRevealDeletedComments: @NO,
+                                    UDKeyEnableFlairColors: @NO,
                                     UDKeyShowRecentlyReadThumbnails: @YES,
+                                    UDKeyFeedTextPostThumbnails: @YES,
                                     UDKeyPreferredGIFFallbackFormat: @1,
                                     UDKeyUnmuteCommentsVideos: @0,
+                                    UDKeyVideoHoldSpeedEnabled: @YES,
+                                    UDKeyVideoHoldSpeed: @2.0,
                                     UDKeyProxyImgurDDG: @NO,
                                     UDKeyImageChestAPIToken: @"",
                                     UDKeyGiphyAPIKey: @"",
+                                    UDKeyUseCustomOAuthSignIn: @YES,
                                     UDKeyEnableInlineImages: @YES,
+                                    UDKeyEnableChatMedia: @YES,
                                     UDKeyInlineImageAlignment: @(ApolloInlineImageAlignmentCenter),
+                                    UDKeyAutoplayInlineGIFs: @(ApolloAutoplayInlineGIFModeDefault),
                                     UDKeyLinkPreviewBodyMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewCommentsMode: @(ApolloLinkPreviewModeFull),
                                     UDKeyLinkPreviewCardColor: @(ApolloLinkPreviewCardColorNeutral),
                                     UDKeyImageUploadProvider: @(ImageUploadProviderImgur),
                                     UDKeyShowUserAvatars: @NO,
                                     UDKeyUseProfileAvatarTabIcon: @NO,
+                                    UDKeyShowDetailedProfiles: @YES,
                                     UDKeyShowSubredditHeaders: @NO,
+                                    UDKeyCommunityHighlights: @NO,
+                                    UDKeyCommunityHighlightsWeb: @NO,
                                     UDKeyAutoHideTabBarShowOnIdle: @NO,
+                                    UDKeyKeepSearchBarInPlace: @NO,
+                                    UDKeyIPadTabBarBottom: @NO,
+                                    UDKeyLiveCommentsFollow: @YES,
                                     UDKeyEnableBulkTranslation: @NO,
                                     UDKeyAutoTranslateOnAppear: @YES,
                                     UDKeyTranslatePostTitles: @NO,
@@ -1037,19 +1548,33 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
                                     UDKeyLibreTranslateURL: @"https://libretranslate.de/translate",
                                     UDKeyLibreTranslateAPIKey: @"",
                                     UDKeyTranslationSkipLanguages: @[],
+                                    UDKeyEnableAISummaries: @NO,
+                                    UDKeyEnableAIPostSummaries: @YES,
+                                    UDKeyEnableAICommentSummaries: @YES,
+                                    UDKeyEnableTapToSummarize: @NO,
+                                    UDKeyPictureInPictureEnabled: @NO,
+                                    UDKeyPictureInPictureActivation: @(ApolloPiPActivationModeUnmutedOnly),
+                                    UDKeyPictureInPictureStartPosition: @(ApolloPiPStartPositionTopRight),
+                                    UDKeyPictureInPictureNative: @NO,
+                                    UDKeyPictureInPictureLoop: @YES,
+                                    UDKeyPictureInPictureStartHidden: @NO,
+                                    UDKeyPictureInPictureSkipButtons: @NO,
+                                    UDKeyPictureInPictureSkipSeconds: @10,
+                                    UDKeyPictureInPictureProgressBar: @NO,
                                     UDKeyTagFilterEnabled: @NO,
                                     UDKeyTagFilterMode: @"blur",
                                     UDKeyTagFilterNSFW: @YES,
                                     UDKeyTagFilterSpoiler: @YES,
                                     UDKeyTagFilterSubredditOverrides: @{},
+                                    UDKeyPostFilterSubreddits: @{},
+                                    UDKeyPostFilterNameSubstrings: @[],
+                                    UDKeyWebJSONEnabled: @NO,
                                     UDKeyNotificationBackendURL: @"",
                                     UDKeyNotificationBackendRegistrationToken: @"",
                                     UDKeyRedditClientSecret: @"",
-                                    UDKeySearchTabRight: @NO,
-                                    UDKeyTabBarShrinkOnScroll: @NO};
+                                    UDKeySearchTabRight: @NO};
     NSUserDefaults *standardDefaults = [NSUserDefaults standardUserDefaults];
     [standardDefaults registerDefaults:defaultValues];
-
     NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
     NSDictionary *persistentDomain = bundleID.length > 0 ? [standardDefaults persistentDomainForName:bundleID] : nil;
 
@@ -1060,16 +1585,31 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
     sRedirectURI = (NSString *)[[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyRedirectURI] ?: @"" copy];
     sUserAgent = (NSString *)[[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyUserAgent] ?: @"" copy];
     sBlockAnnouncements = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyBlockAnnouncements];
+    sShowDeletedComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDeletedComments];
+    sTapToRevealDeletedComments = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTapToRevealDeletedComments];
     sShowRecentlyReadThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowRecentlyReadThumbnails];
+    sFeedTextPostThumbnails = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyFeedTextPostThumbnails];
     sPreferredGIFFallbackFormat = ([[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPreferredGIFFallbackFormat] == 0) ? 0 : 1;
     sReadPostMaxCount = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyReadPostMaxCount];
     sUnmuteCommentsVideos = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyUnmuteCommentsVideos];
+    sVideoHoldSpeedEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyVideoHoldSpeedEnabled];
+    sVideoHoldSpeed = ApolloSanitizedHoldSpeed([[NSUserDefaults standardUserDefaults] floatForKey:UDKeyVideoHoldSpeed]);
     sProxyImgurDDG = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyProxyImgurDDG];
     sEnableInlineImages = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableInlineImages];
+    sEnableChatMedia = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableChatMedia];
+    sEnableAISummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAISummaries];
+    sEnableAIPostSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAIPostSummaries];
+    sEnableAICommentSummaries = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableAICommentSummaries];
+    sEnableTapToSummarize = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableTapToSummarize];
     sInlineImageAlignment = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyInlineImageAlignment];
     if (sInlineImageAlignment < ApolloInlineImageAlignmentCenter || sInlineImageAlignment > ApolloInlineImageAlignmentRight) {
         sInlineImageAlignment = ApolloInlineImageAlignmentCenter;
         [standardDefaults setInteger:sInlineImageAlignment forKey:UDKeyInlineImageAlignment];
+    }
+    sAutoplayInlineGIFMode = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyAutoplayInlineGIFs];
+    if (sAutoplayInlineGIFMode < ApolloAutoplayInlineGIFModeDefault || sAutoplayInlineGIFMode > ApolloAutoplayInlineGIFModeAlways) {
+        sAutoplayInlineGIFMode = ApolloAutoplayInlineGIFModeDefault;
+        [standardDefaults setInteger:sAutoplayInlineGIFMode forKey:UDKeyAutoplayInlineGIFs];
     }
     sLinkPreviewBodyMode = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyLinkPreviewBodyMode];
     if (sLinkPreviewBodyMode < ApolloLinkPreviewModeOff || sLinkPreviewBodyMode > ApolloLinkPreviewModeFull) {
@@ -1086,13 +1626,32 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
         sLinkPreviewCardColor = ApolloLinkPreviewCardColorNeutral;
         [standardDefaults setInteger:sLinkPreviewCardColor forKey:UDKeyLinkPreviewCardColor];
     }
-    ApolloLog(@"[LinkPreviews] settings loaded bodyMode=%ld commentsMode=%ld cardColor=%ld", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, (long)sLinkPreviewCardColor);
+    // Free-form hex card color. Default is "" — the neutral card — so a bright
+    // full-fill is fully opt-in via the picker. The legacy preset enum is
+    // deliberately NOT promoted into a color: those presets only ever rendered as
+    // a faint 8-14% tint, so turning them into a bold full-card fill on update
+    // would be jarring. Existing pickers re-choose a color if they want one.
+    NSString *cardColorHex = [standardDefaults stringForKey:UDKeyLinkPreviewCardColorHex];
+    if (![standardDefaults objectForKey:UDKeyLinkPreviewCardColorHex]) {
+        cardColorHex = @"";
+        [standardDefaults setObject:@"" forKey:UDKeyLinkPreviewCardColorHex];
+    }
+    ApolloSetLinkPreviewCardColorHex(cardColorHex);
+    ApolloLog(@"[LinkPreviews] settings loaded bodyMode=%ld commentsMode=%ld cardColor=%ld cardColorHex=%@", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, (long)sLinkPreviewCardColor, sLinkPreviewCardColorHex ?: @"(default)");
     sImageUploadProvider = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyImageUploadProvider];
     sShowUserAvatars = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowUserAvatars];
     sUseProfileAvatarTabIcon = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyUseProfileAvatarTabIcon];
+    sShowDetailedProfiles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowDetailedProfiles];
     sShowSubredditHeaders = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyShowSubredditHeaders];
+    sCommunityHighlights = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlights];
+    sCommunityHighlightsWeb = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyCommunityHighlightsWeb];
     sAutoHideTabBarShowOnIdle = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoHideTabBarShowOnIdle];
+    sKeepSearchBarInPlace = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyKeepSearchBarInPlace];
+    sIPadTabBarBottom = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyIPadTabBarBottom];
+    sLiveCommentsFollow = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyLiveCommentsFollow];
     sModernSubredditDividers = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyModernSubredditDividers];
+    sSubredditListEnhancements = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeySubredditListEnhancements];
+    sEnableFlairColors = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFlairColors];
     sEnableBulkTranslation = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableBulkTranslation];
     sAutoTranslateOnAppear = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyAutoTranslateOnAppear];
     sTranslatePostTitles = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTranslatePostTitles];
@@ -1100,8 +1659,8 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
     NSString *targetLanguage = (NSString *)[[NSUserDefaults standardUserDefaults] objectForKey:UDKeyTranslationTargetLanguage];
     sTranslationTargetLanguage = [targetLanguage length] > 0 ? [targetLanguage copy] : nil;
 
-    // Provider: only "google" or "libre" are supported. Migrate any older
-    // "apple" value to "google" so existing users land on a working provider.
+    // Provider: "google", "libre", or "apple" (on-device, iOS 18+). "apple" on an
+    // older system can't run, so migrate it to Google for those users.
     id providerValue = [persistentDomain objectForKey:UDKeyTranslationProvider];
     NSString *provider = [providerValue isKindOfClass:[NSString class]] ? (NSString *)providerValue : nil;
 
@@ -1109,8 +1668,10 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
         sTranslationProvider = @"libre";
     } else if ([provider isEqualToString:@"google"]) {
         sTranslationProvider = @"google";
+    } else if ([provider isEqualToString:@"apple"] && IsAppleTranslationSupported()) {
+        sTranslationProvider = @"apple";
     } else {
-        // Unset, unrecognized, or legacy "apple" — default to Google.
+        // Unset, unrecognized, or "apple" on an unsupported OS — default to Google.
         sTranslationProvider = @"google";
         [standardDefaults setObject:sTranslationProvider forKey:UDKeyTranslationProvider];
         [standardDefaults setBool:NO forKey:UDKeyTranslationProviderUserSelected];
@@ -1142,6 +1703,43 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
         sTranslationSkipLanguages = [clean copy];
     }
 
+    // Web JSON: read the flag here, but defer the keychain-backed
+    // cookie/modhash/username hydration until AFTER the SecItem fishhooks are
+    // installed below — in the simulator the keychain is virtualized by those
+    // hooks, so reading before they're in place returns nothing.
+    sWebJSONEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyWebJSONEnabled];
+    // Surface a revoked/expired cookie (detected response-side in
+    // ApolloWebJSONNoteResponse) as a re-login prompt wherever the user is.
+    [[NSNotificationCenter defaultCenter] addObserverForName:ApolloWebJSONSessionExpiredNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        NSString *username = note.userInfo[@"username"];
+        [ApolloWebSessionLoginViewController presentExpiredSessionPromptForUsername:username];
+    }];
+    // Picture-in-Picture hydration.
+    sPiPEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureEnabled];
+    sPiPActivationMode = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPictureInPictureActivation];
+    if (sPiPActivationMode < ApolloPiPActivationModeAllVideos || sPiPActivationMode > ApolloPiPActivationModeAllVideosAndGifs) {
+        sPiPActivationMode = ApolloPiPActivationModeUnmutedOnly; // matches the registered default
+        [standardDefaults setInteger:sPiPActivationMode forKey:UDKeyPictureInPictureActivation];
+    }
+    sPiPStartPosition = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPictureInPictureStartPosition];
+    if (sPiPStartPosition < ApolloPiPStartPositionTopLeft || sPiPStartPosition > ApolloPiPStartPositionLastPosition) {
+        sPiPStartPosition = ApolloPiPStartPositionTopRight;
+        [standardDefaults setInteger:sPiPStartPosition forKey:UDKeyPictureInPictureStartPosition];
+    }
+    sPiPNativeEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureNative];
+    sPiPLoop = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureLoop];
+    sPiPStartHidden = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureStartHidden];
+    sPiPSkipButtons = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureSkipButtons];
+    sPiPSkipSeconds = [[NSUserDefaults standardUserDefaults] integerForKey:UDKeyPictureInPictureSkipSeconds];
+    if (sPiPSkipSeconds != 5 && sPiPSkipSeconds != 10 && sPiPSkipSeconds != 15 && sPiPSkipSeconds != 30) {
+        sPiPSkipSeconds = 10;
+        [standardDefaults setInteger:sPiPSkipSeconds forKey:UDKeyPictureInPictureSkipSeconds];
+    }
+    sPiPProgressBar = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyPictureInPictureProgressBar];
+
     // Tag filter feature hydration.
     sTagFilterEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTagFilterEnabled];
     sTagFilterNSFW = [[NSUserDefaults standardUserDefaults] boolForKey:UDKeyTagFilterNSFW];
@@ -1168,6 +1766,55 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
             }
         }
         sTagFilterSubredditOverrides = [clean copy];
+    }
+
+    // Post filters (Reborn) hydration — defensive isKindOfClass-guarded rebuild
+    // (defaults can carry user-imported / backup-restored junk). Normalize keys and
+    // terms through ApolloPostFilterStore — the SAME single source of truth the
+    // write side uses — so runtime lookups match even for externally-edited plists
+    // (sub keys get the r/ strip; flairs get emoji-strip + whitespace-collapse).
+    // Keep sub keys even when their rule lists are empty (an added but unconfigured
+    // subreddit stays in the list until explicitly removed).
+    {
+        id raw = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyPostFilterSubreddits];
+        NSMutableDictionary<NSString *, NSDictionary *> *clean = [NSMutableDictionary dictionary];
+        if ([raw isKindOfClass:[NSDictionary class]]) {
+            for (id key in (NSDictionary *)raw) {
+                if (![key isKindOfClass:[NSString class]]) continue;
+                NSString *sub = [ApolloPostFilterStore normalizeSubreddit:(NSString *)key];
+                if (sub.length == 0) continue;
+                id v = ((NSDictionary *)raw)[key];
+                if (![v isKindOfClass:[NSDictionary class]]) continue;
+                NSMutableDictionary *rules = [NSMutableDictionary dictionary];
+                for (NSString *field in @[@"keywords", @"flairs"]) {
+                    id arr = ((NSDictionary *)v)[field];
+                    if (![arr isKindOfClass:[NSArray class]]) continue;
+                    BOOL isFlairs = [field isEqualToString:@"flairs"];
+                    NSMutableArray<NSString *> *terms = [NSMutableArray array];
+                    for (id t in (NSArray *)arr) {
+                        if (![t isKindOfClass:[NSString class]]) continue;
+                        NSString *s = isFlairs ? [ApolloPostFilterStore normalizeFlair:(NSString *)t]
+                                               : [ApolloPostFilterStore normalizeTerm:(NSString *)t];
+                        if (s.length > 0 && ![terms containsObject:s]) [terms addObject:s];
+                    }
+                    if (terms.count > 0) rules[field] = [terms copy];
+                }
+                clean[sub] = [rules copy];
+            }
+        }
+        sPostFilterSubreddits = [clean copy];
+    }
+    {
+        id raw = [[NSUserDefaults standardUserDefaults] objectForKey:UDKeyPostFilterNameSubstrings];
+        NSMutableArray<NSString *> *clean = [NSMutableArray array];
+        if ([raw isKindOfClass:[NSArray class]]) {
+            for (id v in (NSArray *)raw) {
+                if (![v isKindOfClass:[NSString class]]) continue;
+                NSString *s = [ApolloPostFilterStore normalizeTerm:(NSString *)v];
+                if (s.length > 0 && ![clean containsObject:s]) [clean addObject:s];
+            }
+        }
+        sPostFilterNameSubstrings = [clean copy];
     }
 
     // Trim ReadPostIDs if over configured max
@@ -1241,7 +1888,20 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
         {"uname", (void *)uname_replacement, (void **)&uname_orig}
     }, 4);
 
+#if APOLLO_SIM_BUILD
+    // Virtualized-keychain delete (see the SecItem* shim above): only needed in the simulator,
+    // where the real keychain is unreachable. Kept out of the device rebind set entirely.
+    rebind_symbols((struct rebinding[1]) {
+        {"SecItemDelete", (void *)SecItemDelete_replacement, (void **)&SecItemDelete_orig},
+    }, 1);
+#endif
+
     if ([[NSUserDefaults standardUserDefaults] boolForKey:UDKeyEnableFLEX]) {
+        if (!%c(FLEXManager)) {
+            // try to load from our ApolloReborn.bundle/libFLEX.dylib
+            NSString *flexFromBundle = ApolloBundledResourcePath(@"libflex", @"dylib");
+            if (flexFromBundle) dlopen(flexFromBundle.UTF8String, RTLD_LAZY);
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[%c(FLEXManager) performSelector:@selector(sharedManager)] performSelector:@selector(showExplorer)];
         });
@@ -1249,8 +1909,43 @@ static void ApolloApplyMinimizationBehavior(UITabBarController *tabBarController
 
     initializeRandomSources();
 
-    // Redirect user to Custom API settings if no API credentials are set
-    if ([sRedditClientId length] == 0) {
+    // Web JSON keychain hydration — must run after the SecItem fishhooks above so
+    // the simulator's virtualized keychain is in place (see the deferral note
+    // where sWebJSONEnabled is read). Migrates any legacy NSUserDefaults cookie,
+    // then any legacy single-global session, into the per-account store.
+    ApolloWebJSONLoadPersistedCredentials();
+    if (sWebJSONEnabled) {
+        NSArray<NSString *> *webSessionUsers = ApolloWebSessionUsernames().allObjects;
+        ApolloLog(@"[WebJSON] enabled at launch, %lu web-session account(s): %@",
+                  (unsigned long)webSessionUsers.count, webSessionUsers);
+    }
+
+    // Cold-start identity: synthesize a signed-in account for every stored
+    // per-account web session that doesn't have one yet. Deliberately NOT gated
+    // on ApolloWebJSONHasUsableSession() — that now resolves by the ACTIVE
+    // account, which at this point in %ctor is necessarily none (AccountManager
+    // hasn't loaded anything yet this launch), so it would be circular for the
+    // very call that's supposed to create the first account. Gating on the
+    // master flag + iterating every stored web-session username instead handles
+    // both the truly-keyless cold start AND a second/third web-session account
+    // harvested in a previous run that hasn't materialized into RedditAccounts2
+    // yet. ApolloWebJSONSynthesizeSignedInAccount is idempotent per-username.
+    if (sWebJSONEnabled) {
+        for (NSString *username in ApolloWebSessionUsernames()) {
+            @try { ApolloWebJSONSynthesizeSignedInAccount(username); }
+            @catch (NSException *e) { ApolloLog(@"[WebJSON][identity] launch synthesis failed for u/%@: %@", username, e); }
+        }
+    }
+    // This launch loads accounts fresh, so any "restart to activate" state left
+    // over from a mid-session web login is now resolved — clear the indicator.
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyWebJSONPendingRestart];
+    [[NSUserDefaults standardUserDefaults] removeObjectForKey:UDKeyWebJSONPendingRestartUsername];
+
+    // Redirect user to Custom API settings if no API credentials are set — but not
+    // when at least one web-session account is configured (no API key is expected
+    // for those). Checked by configured-account count, not the active account, so
+    // this doesn't depend on which account happens to be current right now.
+    if ([sRedditClientId length] == 0 && !(sWebJSONEnabled && ApolloWebSessionUsernames().count > 0)) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             UIWindow *mainWindow = ((UIWindowScene *)UIApplication.sharedApplication.connectedScenes.anyObject).windows.firstObject;
             UITabBarController *tabBarController = (UITabBarController *)mainWindow.rootViewController;

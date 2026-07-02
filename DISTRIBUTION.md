@@ -4,10 +4,15 @@ This repo can publish the same four Apollo distribution variants that Balackburn
 
 ## Variants
 
-- `Apollo-<apollo>_Apollo-Reborn-<tweak>.ipa`: standard injected IPA
-- `NO-EXTENSIONS_Apollo-<apollo>_Apollo-Reborn-<tweak>.ipa`: standard IPA with app extensions removed
-- `GLASS_Apollo-<apollo>_Apollo-Reborn-<tweak>.ipa`: standard injected IPA plus `patch.sh --liquid-glass`
-- `NO-EXTENSIONS_GLASS_Apollo-<apollo>_Apollo-Reborn-<tweak>.ipa`: no-extensions IPA plus `patch.sh --liquid-glass`
+- `Apollo-Reborn-<tweak>.ipa`: standard injected IPA
+- `Apollo-Reborn-<tweak>-NOEXTENSIONS.ipa`: standard IPA with app extensions removed
+- `Apollo-Reborn-<tweak>-GLASS.ipa`: standard injected IPA plus `patch.sh --liquid-glass`
+- `Apollo-Reborn-<tweak>-GLASS-NOEXTENSIONS.ipa`: no-extensions IPA plus `patch.sh --liquid-glass`
+
+The GitHub release tag still includes the supported Apollo base version
+(`v<apollo>_<tweak>`, for example `v1.15.11_3.0.0`), but the IPA asset names
+are Apollo-Reborn first because the distributed app version is now the
+Apollo-Reborn version.
 
 ## What “No Extensions” Means
 
@@ -20,7 +25,11 @@ Apollo ships with six `.appex` bundles in addition to the main app:
 - `NotificationServiceExtension.appex`
 - `OpenInUIExtension.appex`
 
-Keeping them intact uses 7 App IDs total on free Apple IDs: 1 for the main app plus 6 for the extensions above. Removing them leaves only the main app, so AltStore/SideStore only need 1 App ID for Apollo itself. AltStore documents the underlying limit here: <https://faq.altstore.io/altstore-classic/app-ids>.
+Keeping them intact uses 7 App IDs total on free Apple IDs: 1 for the main app plus 6 for the extensions above. Removing them leaves only the main app, so AltStore Classic/SideStore only need 1 App ID for Apollo itself. AltStore documents the underlying limit here: <https://faq.altstore.io/altstore-classic/app-ids>.
+
+A free Apple ID can register at most **10 App IDs per rolling 7 days**, so the with-extensions build installs on a clean run but leaves only ~3 App IDs of headroom. Reinstalling within the same week, installing under more than one bundle ID, or sideloading other extension-bearing apps can push past 10, at which point the install fails until older App IDs expire (a paid Apple Developer account has a far higher cap). The No Extensions build (1 App ID) is the headroom-friendly fallback. App-group / keychain-access-group entitlements are **not** a factor here: the main app carries them in both builds and the signer rewrites them on re-sign, so a free Apple ID can install either build — the only difference is the App ID count.
+
+> **Note on the v3.2.0 size drop.** Since v3.2.0 the standard build replaces the stock 28 MB `AthenaWidgetExtension.appex` (a 25.6 MB `Assets.car`) with the much smaller `ApolloRebornWidgets.appex` (the stock widget crash-looped and poisoned WidgetKit enumeration). That is why the with-extensions IPA is ~25 MB smaller than v3.1.1's — all the functional extensions are still present (the with-extensions IPA is still larger than No Extensions); only the bloated stock widget was swapped out. A smaller with-extensions IPA is **not** a sign that extensions were dropped.
 
 ## Local Build Flow
 
@@ -62,13 +71,19 @@ The workflow:
 
 1. Builds the rootful tweak `.deb`
 2. Downloads the input Apollo IPA
-3. Builds the four IPA variants
-4. Creates a GitHub release tagged `v<apollo>_<tweak>`
-5. Optionally regenerates:
+3. Validates release metadata before the expensive IPA variant build:
+   - `control` has the Apollo-Reborn tweak version
+   - `distribution/config.json` has a numeric monotonic `app.buildVersion`
+   - `CHANGELOG.md` has a matching `## [v<tweak>]` entry
+   - the computed release tag does not already exist
+4. Builds the four IPA variants
+5. Creates a GitHub release tagged `v<apollo>_<tweak>`
+6. Optionally regenerates and validates:
    - [apps.json](apps.json)
    - [apps_noext.json](apps_noext.json)
    - [apps_glass.json](apps_glass.json)
    - [apps_noext_glass.json](apps_noext_glass.json)
+   - [release-manifest.json](release-manifest.json)
 
 ### When the source JSON / website updates
 
@@ -89,9 +104,11 @@ These two paths never double-run: a release created by the build workflow's own
 for `draft: false`. `publish-sources.yml` can also be dispatched manually to
 rebuild the sources on demand.
 
-## AltStore Source Setup
+## AltStore Classic Source Setup
 
 AltStore Classic sources are plain JSON files. Official schema: <https://faq.altstore.io/developers/make-a-source>.
+
+Apollo-Reborn is supported in AltStore Classic, SideStore, and Feather. It is not compatible with AltStore PAL.
 
 This repo now includes four source files:
 
@@ -113,6 +130,39 @@ That script reads:
 
 and updates the four JSON sources so each source only advertises the matching asset prefix.
 
+### Source metadata and versioning
+
+Per-app metadata (icon, screenshots, description, `appPermissions`) lives in
+[distribution/config.json](distribution/config.json) under `app`, and per-variant
+overrides under each entry in `variants`. Notes on the model:
+
+- **Versioning**: the release pipeline rewrites the main app's
+  `CFBundleShortVersionString` to the Apollo-Reborn tweak version and
+  `CFBundleVersion` to the monotonic build number in
+  [distribution/config.json](distribution/config.json) (currently `286`). The
+  source generator mirrors those exact values in `version` and `buildVersion`
+  because AltStore validates them against the downloaded IPA before installing.
+  Historical IPAs used Apollo's original `1.15.11`/`285` values, so generated
+  sources advertise only the newest installable build while keeping older
+  release notes in `news`.
+- **Build number policy**: `app.buildVersion` must increase for every shipped
+  public release, regardless of how the semantic tweak version changes. For
+  example: `3.0.0 -> 286`, `3.0.1 -> 287`, `3.1.0 -> 288`. Do not reuse a
+  build number, because AltStore/iOS use it to decide upgrade ordering.
+- **`appPermissions`**: AltStore validates a source's declared entitlements and
+  privacy strings against the downloaded IPA and warns ("Install Anyway") or
+  refuses to install on a mismatch, so these must list the complete set the IPA
+  carries. The values are extracted from the Apollo base IPA
+  (`codesign -d --entitlements` across the main app and every `PlugIns/*.appex`
+  for entitlements, `Info.plist` for the `NS*UsageDescription` privacy strings).
+  `application-identifier` and `com.apple.developer.team-identifier` are
+  intentionally omitted per AltStore's guidance. The declared set is identical
+  across all four variants -- the main app binary carries the full entitlement
+  set, so stripping extensions or patching icons does not change it.
+- All four variants share Apollo's bundle identifier, so they cannot be combined
+  into one source (the schema forbids duplicate bundle identifiers per source);
+  one source per variant is required.
+
 Recommended hosting options:
 
 1. Use raw GitHub content URLs directly
@@ -127,9 +177,19 @@ https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main/apps_glass.js
 https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main/apps_noext_glass.json
 ```
 
+Useful add-source link format for AltStore Classic:
+
+```text
+altstore-classic://source?url=https://raw.githubusercontent.com/Apollo-Reborn/Apollo-Reborn/main/apps.json
+```
+
+Repeat with the other JSON URLs for the other variants.
+
+AltStore PAL should not be used here. The JSON format is compatible, but Apollo-Reborn depends on the classic sideload flow.
+
 ## SideStore Setup
 
-SideStore is compatible with AltStore sources: <https://docs.sidestore.io/docs/advanced/app-sources>.
+SideStore is compatible with AltStore Classic sources: <https://docs.sidestore.io/docs/advanced/app-sources>.
 
 That means the same four JSON files work unchanged in SideStore.
 
@@ -161,7 +221,7 @@ For the least moving parts:
 
 1. Keep IPA assets in GitHub Releases for this repo
 2. Keep `apps*.json` in the repo root
-3. Point users at the raw GitHub URLs or wrap them in add-source links for AltStore/SideStore/Feather
+3. Point users at the raw GitHub URLs or wrap them in add-source links for AltStore Classic/SideStore/Feather
 
 That reproduces Balackburn’s distribution model, but with the Liquid Glass asset catalog and icon pipeline owned by this repo instead of living out-of-band.
 

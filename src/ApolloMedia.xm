@@ -2,6 +2,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AVKit/AVKit.h>
 #import <MediaPlayer/MediaPlayer.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -9,12 +10,18 @@
 #import "ApolloMediaAutoplay.h"
 #import "ApolloState.h"
 #import "ApolloMediaMetadata.h"
+#import "ApolloMarkdownToolbarGif.h"
 #import "Tweak.h"
 
+// FFmpegKit's static libs are device-arm64 only, so simulator/dev builds
+// (APOLLO_SIM_BUILD, see Makefile + scripts/run-in-sim.sh) compile without it.
+// The v.redd.it CMAF/MPEG-TS audio fix below is stubbed to %orig in that mode.
+#if !APOLLO_SIM_BUILD
 #import "ffmpeg-kit/ffmpeg-kit/include/MediaInformationSession.h"
 #import "ffmpeg-kit/ffmpeg-kit/include/MediaInformation.h"
 #import "ffmpeg-kit/ffmpeg-kit/include/FFmpegKit.h"
 #import "ffmpeg-kit/ffmpeg-kit/include/FFprobeKit.h"
+#endif
 
 // Regex patterns for v.redd.it CMAF audio streams (Reddit switched from MPEG-TS to CMAF around November 2025)
 static NSString *const HLSAudioRegexPattern = @"#EXT-X-MEDIA:.*?\"(HLS_AUDIO.*?)\\.m3u8";
@@ -26,22 +33,106 @@ static NSString *const StreamableRegexPattern = @"^(?:(?:https?:)?//)?(?:www\\.)
 static NSString *const StreamableRegexPatternWithQueryString = @"^(?:(?:https?:)?//)?(?:www\\.)?streamable\\.com/(?:edit/)?(\\w+)(?:\\?.*)?$";
 
 static const void *kApolloRouteIconRepairLoggedKey = &kApolloRouteIconRepairLoggedKey;
+static const void *kApolloRouteButtonStyleLoggedKey = &kApolloRouteButtonStyleLoggedKey;
 
 static BOOL ApolloMediaStringContains(NSString *haystack, NSString *needle) {
     return [haystack isKindOfClass:[NSString class]] && needle.length > 0 &&
         [haystack rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound;
 }
 
-static BOOL ApolloMediaRouteControlIsInMediaViewer(UIView *view) {
+static BOOL ApolloMediaViewIsInClassNamed(UIView *view, NSString *needle) {
     for (UIResponder *responder = view; responder; responder = responder.nextResponder) {
-        NSString *className = NSStringFromClass(responder.class);
-        if (ApolloMediaStringContains(className, @"MediaViewer") || ApolloMediaStringContains(className, @"MediaPage") || ApolloMediaStringContains(className, @"Player")) return YES;
+        if (ApolloMediaStringContains(NSStringFromClass(responder.class), needle)) return YES;
     }
-    for (UIView *ancestor = view.superview; ancestor; ancestor = ancestor.superview) {
-        NSString *className = NSStringFromClass(ancestor.class);
-        if (ApolloMediaStringContains(className, @"MediaViewer") || ApolloMediaStringContains(className, @"MediaPage") || ApolloMediaStringContains(className, @"Player")) return YES;
+    for (UIView *ancestor = view; ancestor; ancestor = ancestor.superview) {
+        if (ApolloMediaStringContains(NSStringFromClass(ancestor.class), needle)) return YES;
     }
     return NO;
+}
+
+static BOOL ApolloMediaRouteControlIsInMediaViewer(UIView *view) {
+    return ApolloMediaViewIsInClassNamed(view, @"MediaViewer") ||
+        ApolloMediaViewIsInClassNamed(view, @"MediaPage") ||
+        ApolloMediaViewIsInClassNamed(view, @"Player") ||
+        ApolloMediaViewIsInClassNamed(view, @"VideoControlsView");
+}
+
+static void ApolloMediaClearRouteButtonLayer(CALayer *layer, CALayer *primaryImageLayer) {
+    if (!layer) return;
+
+    layer.masksToBounds = NO;
+    layer.cornerRadius = 0.0;
+    layer.borderWidth = 0.0;
+    layer.shadowOpacity = 0.0;
+    if (layer != primaryImageLayer) layer.backgroundColor = nil;
+
+    for (CALayer *sublayer in layer.sublayers) {
+        ApolloMediaClearRouteButtonLayer(sublayer, primaryImageLayer);
+    }
+}
+
+static void ApolloMediaStyleVideoControlsAirPlayButton(UIButton *button, NSString *reason) {
+    if (![button isKindOfClass:[UIButton class]] || !ApolloMediaViewIsInClassNamed(button, @"VideoControlsView")) return;
+
+    UIImage *airPlayImage = [[UIImage imageNamed:@"video-player-airplay"] imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    if (!airPlayImage) return;
+
+    if ([button respondsToSelector:@selector(setConfiguration:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(button, @selector(setConfiguration:), nil);
+    }
+    if ([button respondsToSelector:@selector(setConfigurationUpdateHandler:)]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(button, @selector(setConfigurationUpdateHandler:), nil);
+    }
+
+    const UIControlState states[] = {
+        UIControlStateNormal,
+        UIControlStateHighlighted,
+        UIControlStateSelected,
+        UIControlStateSelected | UIControlStateHighlighted,
+        UIControlStateDisabled,
+        UIControlStateFocused,
+        UIControlStateSelected | UIControlStateFocused,
+        UIControlStateApplication,
+        UIControlStateSelected | UIControlStateApplication,
+    };
+    for (NSUInteger i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+        [button setImage:airPlayImage forState:states[i]];
+        [button setBackgroundImage:nil forState:states[i]];
+    }
+
+    BOOL activeRoute = button.selected || ((button.state & UIControlStateSelected) == UIControlStateSelected);
+    if (activeRoute) {
+        button.tintColor = [UIColor respondsToSelector:@selector(systemBlueColor)] ? [UIColor systemBlueColor] : [UIColor colorWithRed:0.0 green:0.478 blue:1.0 alpha:1.0];
+    } else {
+        button.tintColor = [UIColor whiteColor];
+    }
+
+    button.backgroundColor = [UIColor clearColor];
+    button.adjustsImageWhenHighlighted = NO;
+    button.clipsToBounds = NO;
+    button.contentMode = UIViewContentModeScaleAspectFit;
+    button.imageView.hidden = NO;
+    button.imageView.image = airPlayImage;
+    button.imageView.highlightedImage = airPlayImage;
+    button.imageView.tintColor = button.tintColor;
+    button.imageView.backgroundColor = [UIColor clearColor];
+    button.imageView.clipsToBounds = NO;
+    button.imageView.contentMode = UIViewContentModeScaleAspectFit;
+
+    for (UIView *subview in button.subviews) {
+        subview.backgroundColor = [UIColor clearColor];
+        subview.clipsToBounds = NO;
+        subview.layer.masksToBounds = NO;
+        if ([subview isKindOfClass:[UIImageView class]] && subview != button.imageView) {
+            subview.hidden = YES;
+        }
+    }
+    ApolloMediaClearRouteButtonLayer(button.layer, button.imageView.layer);
+
+    if (objc_getAssociatedObject(button, kApolloRouteButtonStyleLoggedKey) == nil) {
+        objc_setAssociatedObject(button, kApolloRouteButtonStyleLoggedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        ApolloLog(@"[MediaRouteIcon] styled VideoControlsView AirPlay button class=%@ state=%lu reason=%@", NSStringFromClass(button.class) ?: @"(unknown)", (unsigned long)button.state, reason ?: @"(unknown)");
+    }
 }
 
 static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *reason) {
@@ -69,6 +160,7 @@ static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *rea
         if ([view isKindOfClass:[UIButton class]]) {
             UIButton *button = (UIButton *)view;
             button.imageView.contentMode = UIViewContentModeScaleAspectFit;
+            ApolloMediaStyleVideoControlsAirPlayButton(button, reason);
         } else if ([view isKindOfClass:[UIImageView class]]) {
             ((UIImageView *)view).contentMode = UIViewContentModeScaleAspectFit;
         }
@@ -95,6 +187,22 @@ static void ApolloMediaRepairRouteControlLayout(UIView *routeView, NSString *rea
 - (void)layoutSubviews {
     %orig;
     ApolloMediaRepairRouteControlLayout((UIView *)self, @"MPVolumeView layoutSubviews");
+}
+
+%end
+
+%hook _TtC6Apollo17VideoControlsView
+
+- (void)layoutSubviews {
+    %orig;
+    UIButton *airPlayButton = MSHookIvar<UIButton *>(self, "airPlayButton");
+    ApolloMediaStyleVideoControlsAirPlayButton(airPlayButton, @"VideoControlsView layoutSubviews");
+}
+
+- (void)observeValueForKeyPath:(id)keyPath ofObject:(id)object change:(id)change context:(void *)context {
+    %orig(keyPath, object, change, context);
+    UIButton *airPlayButton = MSHookIvar<UIButton *>(self, "airPlayButton");
+    ApolloMediaStyleVideoControlsAirPlayButton(airPlayButton, @"VideoControlsView KVO");
 }
 
 %end
@@ -352,8 +460,11 @@ static const NSTimeInterval kApolloGifLoopSeekDedupeWindow = 0.25;
 // - Newer streams use CMAF/MP4 containers (fix: extract AAC and wrap in ADTS)
 - (void)URLSession:(NSURLSession *)urlSession downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)fileUrl {
     NSURL *originalURL = downloadTask.originalRequest.URL;
+#if !APOLLO_SIM_BUILD
+    // Only the FFmpeg remux paths use these; the simulator build stubs them out.
     NSString *path = fileUrl.absoluteString;
     NSString *fixedPath = [path stringByAppendingString:@".fixed"];
+#endif
 
     BOOL isCMAFAudio = [originalURL.absoluteString containsString:@"CMAF_AUDIO"] && [originalURL.pathExtension isEqualToString:@"mp4"];
     BOOL isHLSAudio = [originalURL.pathExtension isEqualToString:@"aac"];
@@ -363,6 +474,14 @@ static const NSTimeInterval kApolloGifLoopSeekDedupeWindow = 0.25;
         return;
     }
 
+#if APOLLO_SIM_BUILD
+    // Simulator/dev build: FFmpegKit is unavailable, so skip the audio container
+    // remux and let Apollo download the stream unmodified. Affected v.redd.it
+    // audio won't play correctly here — test that path on a device build.
+    ApolloLog(@"[-URLSession:downloadTask:didFinishDownloadingToURL:] APOLLO_SIM_BUILD: skipping FFmpeg audio fix for %@", originalURL);
+    %orig;
+    return;
+#else
     if (isCMAFAudio) {
         // CMAF audio is MP4 container with AAC - extract to ADTS format
         ApolloLog(@"[-URLSession:downloadTask:didFinishDownloadingToURL:] Converting CMAF MP4 audio to ADTS: %@", originalURL);
@@ -407,6 +526,7 @@ static const NSTimeInterval kApolloGifLoopSeekDedupeWindow = 0.25;
         [fileManager moveItemAtURL:fixedUrl toURL:fileUrl error:nil];
     }
     %orig;
+#endif
 }
 
 %end
@@ -584,6 +704,61 @@ static NSString *ApolloFixProcessingImgPlaceholders(NSString *text, NSDictionary
     return replacedCount > 0 ? fixed : text;
 }
 
+// Rewrite Reddit-native Giphy markdown tokens `![gif](giphy|<id>)` (which our
+// markdown toolbar inserts and Reddit's server recognizes natively) into real
+// Giphy CDN URLs so Apollo's inline-image renderer can display the GIF in the
+// optimistic local view right after submit — before Reddit's canonical
+// response (with proper `mediaMetadata` entries keyed by `giphy|<id>`) comes
+// back. Without this, Apollo tries to load `giphy|<id>` as a URL, fails, and
+// shows its built-in "If you are looking for an image, it was probably
+// deleted." placeholder.
+//
+// CRITICAL: only rewrite per-token when there is NO matching `mediaMetadata`
+// entry for that giphy ID. Once Reddit returns canonical metadata, Apollo's
+// own renderer uses the `giphy|<id>` token to look up the metadata entry and
+// render the GIF inline — rewriting the token would break that path and
+// produce "[Unknown Image]". The optimistic local case (no metadata yet) is
+// the only one where we want the rewrite.
+static NSString *ApolloRewriteNativeGiphyTokens(NSString *text, NSDictionary *metadata) {
+    if (text.length == 0) return text;
+    if ([text rangeOfString:@"(giphy|"].location == NSNotFound) return text;
+
+    NSRegularExpression *regex = ApolloNativeGiphyMarkdownTokenRegex();
+    if (!regex) return text;
+
+    NSArray *matches = [regex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (matches.count == 0) return text;
+
+    BOOL hasMetadata = [metadata isKindOfClass:[NSDictionary class]] && metadata.count > 0;
+    NSMutableString *fixed = [text mutableCopy];
+    NSUInteger replacedCount = 0;
+    NSUInteger skippedHasMetadataCount = 0;
+    for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
+        NSString *giphyID = [fixed substringWithRange:[match rangeAtIndex:1]];
+        if (giphyID.length == 0) continue;
+
+        // Skip if Apollo's native renderer can handle this token via mediaMetadata.
+        if (hasMetadata) {
+            NSString *metadataKey = [NSString stringWithFormat:@"giphy|%@", giphyID];
+            id entry = metadata[metadataKey];
+            if ([entry isKindOfClass:[NSDictionary class]]) {
+                skippedHasMetadataCount++;
+                continue;
+            }
+        }
+
+        NSString *replacement = [NSString stringWithFormat:@"![GIF](https://media.giphy.com/media/%@/giphy.gif)", giphyID];
+        [fixed replaceCharactersInRange:match.range withString:replacement];
+        replacedCount++;
+    }
+
+    if (replacedCount > 0 || skippedHasMetadataCount > 0) {
+        ApolloLog(@"[NativeGiphyBody] rewrote=%lu skipped(hasMetadata)=%lu",
+            (unsigned long)replacedCount, (unsigned long)skippedHasMetadataCount);
+    }
+    return replacedCount > 0 ? fixed : text;
+}
+
 %hook RDKComment
 
 - (void)setMediaMetadata:(NSDictionary *)mediaMetadata {
@@ -593,7 +768,9 @@ static NSString *ApolloFixProcessingImgPlaceholders(NSString *text, NSDictionary
 }
 
 - (NSString *)body {
-    return ApolloFixProcessingImgPlaceholders(%orig, self.mediaMetadata, nil);
+    NSDictionary *metadata = self.mediaMetadata;
+    NSString *fixed = ApolloFixProcessingImgPlaceholders(%orig, metadata, nil);
+    return ApolloRewriteNativeGiphyTokens(fixed, metadata);
 }
 
 %end
@@ -618,7 +795,8 @@ static NSString *ApolloFixProcessingImgPlaceholders(NSString *text, NSDictionary
         if (fallbackExt.length == 0) fallbackExt = @"png";
     }
 
-    return ApolloFixProcessingImgPlaceholders(%orig, metadata, fallbackExt);
+    NSString *fixed = ApolloFixProcessingImgPlaceholders(%orig, metadata, fallbackExt);
+    return ApolloRewriteNativeGiphyTokens(fixed, metadata);
 }
 
 %end

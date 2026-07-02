@@ -140,6 +140,8 @@ typedef struct {
 
 static void ApolloLPLogOncePerHost(NSString *host, NSString *event);
 static void ApolloLPTriggerRelayoutForHost(ASDisplayNode *node, NSString *host);
+static BOOL ApolloLPInvokeRowReloadIfPossible(ASDisplayNode *startNode, NSString *host);
+static ASDisplayNode *ApolloLPFindOwningCellNode(ASDisplayNode *node);
 static BOOL ApolloLPIsRedditUserProfileURL(NSURL *url);
 static NSString *ApolloLPRedditUsernameFromProfileURL(NSURL *url);
 static BOOL ApolloLPIsRedditSubredditURL(NSURL *url);
@@ -902,6 +904,47 @@ static void ApolloLPSetAvatarNodeVisible(ASNetworkImageNode *avatarNode, BOOL vi
     avatarNode.hidden = !visible;
 }
 
+// V21: dead preview images. Clip hosts (streamin, streamff, ...) publish an
+// og:image URL before the thumbnail file actually exists — fresh clips 404
+// for the first few minutes. Remember definitive 4xx failures per URL so the
+// card can render compact instead of a hero with a big blank image area; the
+// mark expires so the card upgrades itself once the thumbnail is generated.
+static const NSTimeInterval kApolloLPDeadImageRetryCooldown = 300.0;
+
+// Declared here (used by both the dead-image path and the V20 shrink path):
+// host string of a row reload that failed while the node was detached, to be
+// re-fired from didEnterVisibleState.
+static char kApolloLPPendingRowReloadHostKey;
+
+static NSMutableDictionary<NSString *, NSDate *> *ApolloLPDeadImageURLs(void) {
+    static NSMutableDictionary *map;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ map = [NSMutableDictionary dictionary]; });
+    return map;
+}
+
+static void ApolloLPMarkImageURLDead(NSURL *url) {
+    NSString *key = url.absoluteString;
+    if (key.length == 0) return;
+    @synchronized (ApolloLPDeadImageURLs()) {
+        ApolloLPDeadImageURLs()[key] = [NSDate date];
+    }
+}
+
+static BOOL ApolloLPImageURLIsDead(NSURL *url) {
+    NSString *key = url.absoluteString;
+    if (key.length == 0) return NO;
+    @synchronized (ApolloLPDeadImageURLs()) {
+        NSDate *diedAt = ApolloLPDeadImageURLs()[key];
+        if (!diedAt) return NO;
+        if ([[NSDate date] timeIntervalSinceDate:diedAt] > kApolloLPDeadImageRetryCooldown) {
+            [ApolloLPDeadImageURLs() removeObjectForKey:key];
+            return NO;
+        }
+        return YES;
+    }
+}
+
 static void ApolloLPApplyFallbackImage(ASNetworkImageNode *imageNode, NSURL *imageURL, UIImage *image, NSString *host) {
     if (!imageNode || !image || image.size.width <= 0.0 || image.size.height <= 0.0) return;
     NSURL *currentURL = objc_getAssociatedObject(imageNode, &kApolloLinkPreviewImageFallbackURLKey);
@@ -923,6 +966,10 @@ static void ApolloLPApplyFallbackImage(ASNetworkImageNode *imageNode, NSURL *ima
 
 static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL *imageURL, NSString *host) {
     if (!imageNode || !ApolloLPURLIsHTTP(imageURL)) return;
+    // Dead-marked URLs don't get re-fetched during the cooldown — refetching
+    // on every re-render loops: 404 -> reflow -> row reload -> re-render ->
+    // fetch -> 404 ... (one reload per second, visible as flickering cells).
+    if (ApolloLPImageURLIsDead(imageURL)) return;
     NSString *key = imageURL.absoluteString;
     if (key.length == 0) return;
 
@@ -943,6 +990,7 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
     NSString *hostCopy = [host copy];
     [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
         UIImage *image = data.length > 0 ? [UIImage imageWithData:data scale:UIScreen.mainScreen.scale] : nil;
+        BOOL definitivelyDead = NO;
         if (image) {
             NSUInteger cost = (NSUInteger)(image.size.width * image.size.height * image.scale * image.scale * 4.0);
             [ApolloLPFallbackImageCache() setObject:image forKey:key cost:cost];
@@ -954,6 +1002,11 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
                       (unsigned long)data.length,
                       error.localizedDescription ?: @"nil",
                       imageURL.absoluteString);
+            // 4xx = the file genuinely isn't there (clip hosts publish og:image
+            // before generating the thumbnail). Transient network errors and
+            // 5xx don't dead-mark, so flaky connectivity can't compact-ify
+            // every card.
+            definitivelyDead = httpResponse.statusCode >= 400 && httpResponse.statusCode < 500;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -961,12 +1014,37 @@ static void ApolloLPStartFallbackImageFetch(ASNetworkImageNode *imageNode, NSURL
             if (!strongImageNode) return;
             objc_setAssociatedObject(strongImageNode, &kApolloLinkPreviewImageFallbackInFlightKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             ApolloLPApplyFallbackImage(strongImageNode, imageURL, image, hostCopy);
+
+            if (definitivelyDead && !ApolloLPImageURLIsDead(imageURL)) {
+                // V21: re-render the host card as compact instead of leaving a
+                // dead hero image area, and fix the row height (or defer the
+                // reload to visibility if the node is detached, as in V20).
+                // The reflow fires only on the FIRST death of a URL — the
+                // dead-mark suppresses further fetches, so repeats mean a
+                // race, and reflowing again would loop the row reload.
+                ApolloLPMarkImageURLDead(imageURL);
+                ASDisplayNode *hostNode = (ASDisplayNode *)strongImageNode;
+                for (int hops = 0; hostNode && hops < 24; hops++) {
+                    if ([NSStringFromClass([hostNode class]) containsString:@"LinkButtonNode"]) break;
+                    hostNode = hostNode.supernode;
+                }
+                if (hostNode) {
+                    ApolloLog(@"[LinkPreviews] V21-dead-image-compact-reflow host=%@", hostCopy ?: ApolloLPHost(imageURL));
+                    ApolloLPTriggerRelayoutForHost(hostNode, hostCopy);
+                    ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(hostNode);
+                    if (!ApolloLPInvokeRowReloadIfPossible(cellNode ?: hostNode, hostCopy)) {
+                        objc_setAssociatedObject(hostNode, &kApolloLPPendingRowReloadHostKey,
+                                                 hostCopy ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+                    }
+                }
+            }
         });
     }] resume];
 }
 
 static void ApolloLPScheduleImageFallbackIfNeeded(ASNetworkImageNode *imageNode, NSURL *imageURL, NSString *host) {
     if (!imageNode || !ApolloLPURLIsHTTP(imageURL)) return;
+    if (ApolloLPImageURLIsDead(imageURL)) return;
     objc_setAssociatedObject(imageNode, &kApolloLinkPreviewImageFallbackURLKey, imageURL, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     NSString *cacheKey = imageURL.absoluteString;
@@ -1012,34 +1090,60 @@ static UIColor *ApolloLPBlendColor(UIColor *foreground, UIColor *background, CGF
                            alpha:1.0];
 }
 
-static UIColor *ApolloLPColorForCardPreset(NSInteger preset) {
-    switch (preset) {
-        case ApolloLinkPreviewCardColorGray:     return [UIColor colorWithWhite:0.56 alpha:1.0];
-        case ApolloLinkPreviewCardColorRed:      return [UIColor colorWithRed:1.00 green:0.23 blue:0.19 alpha:1.0];
-        case ApolloLinkPreviewCardColorOrange:   return [UIColor colorWithRed:1.00 green:0.58 blue:0.00 alpha:1.0];
-        case ApolloLinkPreviewCardColorYellow:   return [UIColor colorWithRed:1.00 green:0.80 blue:0.00 alpha:1.0];
-        case ApolloLinkPreviewCardColorGreen:    return [UIColor colorWithRed:0.20 green:0.78 blue:0.35 alpha:1.0];
-        case ApolloLinkPreviewCardColorMint:     return [UIColor colorWithRed:0.00 green:0.78 blue:0.75 alpha:1.0];
-        case ApolloLinkPreviewCardColorTeal:     return [UIColor colorWithRed:0.19 green:0.69 blue:0.78 alpha:1.0];
-        case ApolloLinkPreviewCardColorCyan:     return [UIColor colorWithRed:0.20 green:0.68 blue:0.90 alpha:1.0];
-        case ApolloLinkPreviewCardColorBlue:     return [UIColor colorWithRed:0.00 green:0.48 blue:1.00 alpha:1.0];
-        case ApolloLinkPreviewCardColorIndigo:   return [UIColor colorWithRed:0.35 green:0.34 blue:0.84 alpha:1.0];
-        case ApolloLinkPreviewCardColorPurple:   return [UIColor colorWithRed:0.69 green:0.32 blue:0.87 alpha:1.0];
-        case ApolloLinkPreviewCardColorPink:     return [UIColor colorWithRed:1.00 green:0.18 blue:0.33 alpha:1.0];
-        case ApolloLinkPreviewCardColorBrown:    return [UIColor colorWithRed:0.64 green:0.52 blue:0.37 alpha:1.0];
-        case ApolloLinkPreviewCardColorCoral:    return [UIColor colorWithRed:1.00 green:0.50 blue:0.31 alpha:1.0];
-        case ApolloLinkPreviewCardColorLime:     return [UIColor colorWithRed:0.60 green:0.80 blue:0.00 alpha:1.0];
-        case ApolloLinkPreviewCardColorOlive:    return [UIColor colorWithRed:0.50 green:0.60 blue:0.20 alpha:1.0];
-        case ApolloLinkPreviewCardColorLavender: return [UIColor colorWithRed:0.56 green:0.45 blue:0.90 alpha:1.0];
-        case ApolloLinkPreviewCardColorSlate:    return [UIColor colorWithRed:0.35 green:0.43 blue:0.50 alpha:1.0];
-        case ApolloLinkPreviewCardColorNeutral:
-        default:                                 return [UIColor colorWithWhite:0.72 alpha:1.0];
-    }
+// Resolves the user's free-form card color from the render-safe packed snapshot
+// (sLinkPreviewCardColorPacked). Returns nil when no custom color is set
+// ("Default"), in which case the card keeps the standard neutral background.
+// Reads the volatile uint32 (atomic aligned load on arm64) — never the NSString
+// global, which the settings UI reassigns on the main thread.
+static UIColor *ApolloLPCustomCardColor(void) {
+    uint32_t packed = sLinkPreviewCardColorPacked;
+    if ((packed & (1u << 24)) == 0) return nil;
+    CGFloat r = ((packed >> 16) & 0xFF) / 255.0;
+    CGFloat g = ((packed >> 8) & 0xFF) / 255.0;
+    CGFloat b = (packed & 0xFF) / 255.0;
+    return [UIColor colorWithRed:r green:g blue:b alpha:1.0];
+}
+
+// When a custom card color is active, fills primary/secondary text colors that
+// contrast with it (black-on-light / white-on-dark). Returns NO for the default
+// neutral card so callers keep the dynamic system label colors.
+static BOOL ApolloLPCustomCardTextColors(UIColor **primaryOut, UIColor **secondaryOut) {
+    UIColor *card = ApolloLPCustomCardColor();
+    if (!card) return NO;
+    BOOL light = ApolloColorIsLight(card);
+    UIColor *primary = light ? [UIColor colorWithWhite:0.0 alpha:1.0] : [UIColor colorWithWhite:1.0 alpha:1.0];
+    // Secondary text (site name, description) is the same ink at reduced opacity
+    // so it reads as a softer tier without introducing a clashing hue.
+    UIColor *secondary = [primary colorWithAlphaComponent:light ? 0.62 : 0.78];
+    if (primaryOut) *primaryOut = primary;
+    if (secondaryOut) *secondaryOut = secondary;
+    return YES;
+}
+
+// Rewrites just the foreground color of an existing text node's attributed text,
+// preserving its string + font. Lets a live card recolor instantly when the user
+// changes the card color, without rebuilding the whole layout from the preview.
+static void ApolloLPRecolorTextNode(ASTextNode *node, UIColor *color) {
+    if (!node || !color || ![node respondsToSelector:@selector(attributedText)]) return;
+    NSAttributedString *current = node.attributedText;
+    if (current.length == 0) return;
+    NSMutableAttributedString *mutableText = [current mutableCopy];
+    [mutableText addAttribute:NSForegroundColorAttributeName value:color range:NSMakeRange(0, mutableText.length)];
+    node.attributedText = mutableText;
 }
 
 static UIColor *ApolloLPCardBackgroundColorForNode(ASDisplayNode *hostNode, NSURL *url) {
-    UIColor *tintColor = ApolloLPColorForCardPreset(sLinkPreviewCardColor);
-    ApolloLPLogOncePerHost(ApolloLPHost(url), @"V13-card-color-preset-resolved");
+    UIColor *custom = ApolloLPCustomCardColor();
+    if (custom) {
+        // Paint the card the exact picked color, identical in light/dark, so the
+        // result matches the swatch the user chose (WYSIWYG). Text auto-contrasts.
+        ApolloLPLogOncePerHost(ApolloLPHost(url), @"V13-card-color-custom-resolved");
+        return custom;
+    }
+
+    // Default ("Neutral"): keep the original subtle, theme-aware card background.
+    UIColor *tintColor = ApolloLinkPreviewPresetColor(ApolloLinkPreviewCardColorNeutral);
+    ApolloLPLogOncePerHost(ApolloLPHost(url), @"V13-card-color-default-resolved");
 
     if (@available(iOS 13.0, *)) {
         return [UIColor colorWithDynamicProvider:^UIColor *(UITraitCollection *traitCollection) {
@@ -1087,12 +1191,13 @@ static void ApolloLPMarkNodeForColorRefresh(ASDisplayNode *node) {
 static BOOL ApolloLPApplyCardBackgroundColor(ASDisplayNode *hostNode, ASDisplayNode *backgroundNode, NSURL *url, BOOL force) {
     if (!backgroundNode || ![backgroundNode respondsToSelector:@selector(setBackgroundColor:)]) return NO;
 
-    NSNumber *lastPresetNumber = objc_getAssociatedObject(backgroundNode, &kApolloLinkPreviewBackgroundColorPresetKey);
-    BOOL presetChanged = ![lastPresetNumber isKindOfClass:[NSNumber class]] || lastPresetNumber.integerValue != sLinkPreviewCardColor;
+    NSNumber *currentToken = @((unsigned long)sLinkPreviewCardColorPacked);
+    NSNumber *lastToken = objc_getAssociatedObject(backgroundNode, &kApolloLinkPreviewBackgroundColorPresetKey);
+    BOOL presetChanged = ![lastToken isKindOfClass:[NSNumber class]] || ![lastToken isEqualToNumber:currentToken];
     if (!force && !presetChanged) return NO;
 
     backgroundNode.backgroundColor = ApolloLPCardBackgroundColorForNode(hostNode, url);
-    objc_setAssociatedObject(backgroundNode, &kApolloLinkPreviewBackgroundColorPresetKey, @(sLinkPreviewCardColor), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(backgroundNode, &kApolloLinkPreviewBackgroundColorPresetKey, currentToken, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloLPMarkNodeForColorRefresh(backgroundNode);
     ApolloLPMarkNodeForColorRefresh(hostNode);
     return YES;
@@ -1197,7 +1302,11 @@ static BOOL ApolloLPSetTextNodeAttributedTextIfChanged(ASTextNode *textNode, NSA
 
 static NSString *ApolloLPCleanDisplayText(NSString *text) {
     if (![text isKindOfClass:[NSString class]] || text.length == 0) return text;
-    NSString *clean = [text stringByReplacingOccurrencesOfString:@"&nbsp;" withString:@" "];
+    // Decode HTML entities FIRST (named + numeric, incl. « » ° €) — the fetcher
+    // decodes freshly-stored metadata, but cached and *translated* card text reach
+    // this render choke point raw and would otherwise show literal "&laquo;".
+    // Decoding before tag-stripping also lets an encoded "&lt;b&gt;" collapse out.
+    NSString *clean = ApolloLinkPreviewDecodeEntities(text) ?: text;
     NSRegularExpression *tagRegex = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
     clean = [tagRegex stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
     NSRegularExpression *whitespace = [NSRegularExpression regularExpressionWithPattern:@"\\s+" options:0 error:nil];
@@ -1206,8 +1315,52 @@ static NSString *ApolloLPCleanDisplayText(NSString *text) {
     return clean.length > 0 ? clean : text;
 }
 
+// Like ApolloLPCleanDisplayText, but preserves the text's line structure —
+// used for the Bluesky post body, where paragraph breaks are part of the
+// post (the fetcher already normalized them). Collapsing \s+ would squish
+// a multi-paragraph post into one run-on blob.
+static NSString *ApolloLPCleanMultilineDisplayText(NSString *text) {
+    if (![text isKindOfClass:[NSString class]] || text.length == 0) return text;
+    // Decode entities first (see ApolloLPCleanDisplayText) — keeps numeric/named
+    // entities out of cached/translated multiline bodies (e.g. Bluesky posts).
+    NSString *clean = ApolloLinkPreviewDecodeEntities(text) ?: text;
+    NSRegularExpression *tagRegex = [NSRegularExpression regularExpressionWithPattern:@"<[^>]+>" options:0 error:nil];
+    clean = [tagRegex stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
+    // \x0B (vertical tab), NOT \v: in ICU regex \v is a class shorthand for
+    // ALL vertical whitespace including \n — it silently ate the very line
+    // breaks this function exists to preserve.
+    NSRegularExpression *inlineWhitespace = [NSRegularExpression regularExpressionWithPattern:@"[\\t\\f\\x0B ]+" options:0 error:nil];
+    clean = [inlineWhitespace stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@" "];
+    NSRegularExpression *blankRuns = [NSRegularExpression regularExpressionWithPattern:@"\\n{3,}" options:0 error:nil];
+    clean = [blankRuns stringByReplacingMatchesInString:clean options:0 range:NSMakeRange(0, clean.length) withTemplate:@"\n\n"];
+    clean = [clean stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return clean.length > 0 ? clean : text;
+}
+
 static NSString *ApolloLPDisplayTitleForPreview(ApolloLinkPreview *preview) {
-    return ApolloLPCleanDisplayText(preview.title);
+    NSString *clean = ApolloLPCleanDisplayText(preview.title);
+
+    // Some pages (single-page apps like fifa.com match-center URLs) only expose
+    // a numeric-ID <title> ("285023 289273 400021448"), which renders as a
+    // meaningless series of numbers in the card. Substitute a clean website
+    // name derived from the source — the eyebrow still shows the full domain.
+    if (ApolloIsJunkNumericTitle(clean)) {
+        NSString *site = preview.siteName;
+        NSString *name = nil;
+        if (site.length > 0 && [site containsString:@"."] && ![site containsString:@" "]) {
+            // Host-like siteName ("fifa.com") -> "FIFA".
+            name = ApolloWebsiteNameFromHost(site);
+        } else if (site.length > 0 && !ApolloIsJunkNumericTitle(site)) {
+            // Already a presentable name (og:site_name / curated, e.g. "YouTube").
+            name = site;
+        }
+        if (name.length > 0) {
+            ApolloLPLogOncePerHost(site, [NSString stringWithFormat:@"junk-numeric-title-substituted->%@", name]);
+            return name;
+        }
+    }
+
+    return clean;
 }
 
 static NSString *ApolloLPDisplayDescriptionForPreview(ApolloLinkPreview *preview) {
@@ -1399,14 +1552,24 @@ static id ApolloLPModelFromNodeIvar(ASDisplayNode *node, const char *ivarName) {
     return model;
 }
 
-// V17: positive class-based detection of the owning cell.
-//   _TtC6Apollo15CommentCellNode       — comments area
-//   _TtC6Apollo22CommentsHeaderCellNode — post selftext shown above the
-//      comment list. Apollo treats this as part of the *comments* experience
-//      (user-facing: `Rich Link Previews - Comments` controls cards here;
-//      `Rich Link Previews - Body` only applies to the feed). So we map it
-//      to comments to match the existing rendering observed when both
-//      cards are compact.
+// Positive class-based detection of the owning cell, by user-facing area.
+// The two areas map to Apollo's two data models (see ApolloInlineImages.xm:
+// CommentCellNode holds an RDKComment via a `comment` ivar; the header and
+// feed post cells hold an RDKLink via a `link` ivar):
+//
+//   Comments area (`Rich Link Previews - Comments`):
+//     _TtC6Apollo15CommentCellNode       — a reply in the comment list.
+//
+//   Body area (`Rich Link Previews - Body`, "feeds and post bodies"):
+//     _TtC6Apollo22CommentsHeaderCellNode — OP selftext shown above the
+//        comment list. This is the *post body*, so it follows the Body
+//        setting (issue #318 — previously mis-mapped to comments).
+//     _TtC6Apollo17LargePostCellNode      — feed post cell (large).
+//     _TtC6Apollo19CompactPostCellNode    — feed post cell (compact).
+//
+// The walk below resolves whichever signal is *nearest* the link button, and
+// falls back to the `comment`/`link` ivar as suspenders when a cell class is
+// renamed in a future Apollo build.
 static Class ApolloLPCommentCellClass(void) {
     static Class cls; static dispatch_once_t once;
     dispatch_once(&once, ^{ cls = objc_getClass("_TtC6Apollo15CommentCellNode"); });
@@ -1415,6 +1578,16 @@ static Class ApolloLPCommentCellClass(void) {
 static Class ApolloLPCommentsHeaderCellClass(void) {
     static Class cls; static dispatch_once_t once;
     dispatch_once(&once, ^{ cls = objc_getClass("_TtC6Apollo22CommentsHeaderCellNode"); });
+    return cls;
+}
+static Class ApolloLPLargePostCellClass(void) {
+    static Class cls; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cls = objc_getClass("_TtC6Apollo17LargePostCellNode"); });
+    return cls;
+}
+static Class ApolloLPCompactPostCellClass(void) {
+    static Class cls; static dispatch_once_t once;
+    dispatch_once(&once, ^{ cls = objc_getClass("_TtC6Apollo19CompactPostCellNode"); });
     return cls;
 }
 
@@ -1426,23 +1599,38 @@ static BOOL ApolloLPResolveAreaByWalk(ASDisplayNode *linkButtonNode, ApolloLPAre
     NSUInteger depth = 0;
     Class commentCellCls = ApolloLPCommentCellClass();
     Class headerCellCls = ApolloLPCommentsHeaderCellClass();
+    Class largePostCellCls = ApolloLPLargePostCellClass();
+    Class compactPostCellCls = ApolloLPCompactPostCellClass();
+    // Nearest-ancestor wins: the first node carrying any positive signal
+    // decides the area. Within a node, Comments signals are checked before
+    // Body signals so a comment cell that also references its parent post
+    // still resolves to comments.
     for (ASDisplayNode *node = linkButtonNode; node; node = node.supernode) {
         depth++;
         Class cls = [node class];
+
+        // --- Comments signals (RDKComment) ---
         if (commentCellCls && cls == commentCellCls) {
             if (outArea) *outArea = ApolloLPAreaComments;
             if (outDepth) *outDepth = depth;
             return YES;
         }
-        if (headerCellCls && cls == headerCellCls) {
-            // Header cell = OP selftext in comments view → comments area.
+        if (ApolloLPModelFromNodeIvar(node, "comment")) {
             if (outArea) *outArea = ApolloLPAreaComments;
             if (outDepth) *outDepth = depth;
             return YES;
         }
-        id comment = ApolloLPModelFromNodeIvar(node, "comment");
-        if (comment) {
-            if (outArea) *outArea = ApolloLPAreaComments;
+
+        // --- Body signals (RDKLink): OP selftext header + feed post cells ---
+        if ((headerCellCls && cls == headerCellCls) ||
+            (largePostCellCls && cls == largePostCellCls) ||
+            (compactPostCellCls && cls == compactPostCellCls)) {
+            if (outArea) *outArea = ApolloLPAreaBody;
+            if (outDepth) *outDepth = depth;
+            return YES;
+        }
+        if (ApolloLPModelFromNodeIvar(node, "link")) {
+            if (outArea) *outArea = ApolloLPAreaBody;
             if (outDepth) *outDepth = depth;
             return YES;
         }
@@ -1564,6 +1752,49 @@ static void ApolloLPStampLinkButtonAreaInTree(ASDisplayNode *root, ApolloLPArea 
     for (ASDisplayNode *child in subnodes) {
         ApolloLPStampLinkButtonAreaInTree(child, area);
     }
+}
+
+// A link counts toward the "collapse multi-link comments to compact" threshold
+// only if it would actually render a preview card: a valid http(s) URL that is
+// not handed off to another renderer (inline media, ImageChest albums, Twitter).
+// This mirrors the skip gates in LinkButtonNode.layoutSpecThatFits: so the count
+// matches what the user will see. The check is URL-only (no metadata fetch
+// dependency) so the count is stable across measurement passes and never causes
+// a hero<->compact flip as previews load in.
+static BOOL ApolloLPURLEligibleForPreviewCard(NSURL *url) {
+    if (![url isKindOfClass:[NSURL class]]) return NO;
+    NSString *scheme = url.scheme.lowercaseString ?: @"";
+    if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
+    if (ApolloLPIsImageChestAlbumURL(url)) return NO;
+    if (ApolloLPShouldDeferToInlineMedia(url)) return NO;
+    if ([ApolloLinkPreviewFetcher isTwitterURL:url]) return NO;
+    return YES;
+}
+
+// Count eligible preview links beneath a node (called on a comment cell).
+// Mirrors the subnode walk in ApolloLPStampLinkButtonAreaInTree. Intentionally
+// not cached: Texture reuses ASCellNode instances for different comments, so a
+// per-cell cached count could leak across reuse. Comment trees are small, so a
+// fresh walk at layout time is cheap and always correct.
+static NSUInteger ApolloLPCountEligiblePreviewLinksInTree(ASDisplayNode *root) {
+    if (!root) return 0;
+    static Class linkButtonCls = Nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ linkButtonCls = objc_getClass("_TtC6Apollo14LinkButtonNode"); });
+
+    NSUInteger count = 0;
+    if (linkButtonCls && [root isKindOfClass:linkButtonCls]) {
+        NSString *urlString = ApolloGetLinkButtonNodeURLString(root);
+        NSURL *url = urlString.length > 0 ? [NSURL URLWithString:urlString] : nil;
+        if (ApolloLPURLEligibleForPreviewCard(url)) count++;
+    }
+    NSArray *subnodes = nil;
+    @try { subnodes = [root respondsToSelector:@selector(subnodes)] ? [(id)root subnodes] : nil; }
+    @catch (__unused NSException *e) { subnodes = nil; }
+    for (ASDisplayNode *child in subnodes) {
+        count += ApolloLPCountEligiblePreviewLinksInTree(child);
+    }
+    return count;
 }
 
 static BOOL ApolloLPIsYouTubeURL(NSURL *url) {
@@ -1703,9 +1934,14 @@ static NSDictionary *ApolloLPPreparedNodeBundle(ASDisplayNode *hostNode, NSURL *
     avatarNode.contentMode = UIViewContentModeScaleAspectFill;
     avatarNode.clipsToBounds = YES;
     avatarNode.cornerRadius = 18.0;
-    ApolloLPSetTextNodeAttributedTextIfChanged(siteNode, ApolloLPAttributedString([siteName uppercaseString], [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold], [UIColor secondaryLabelColor]));
-    ApolloLPSetTextNodeAttributedTextIfChanged(titleNode, ApolloLPAttributedString(ApolloLPDisplayTitleForPreview(preview), [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold], [UIColor labelColor]));
-    ApolloLPSetTextNodeAttributedTextIfChanged(descriptionNode, ApolloLPAttributedString(ApolloLPDisplayDescriptionForPreview(preview), [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular], [UIColor secondaryLabelColor]));
+    // On a custom-colored card, swap the dynamic system label colors for ink
+    // that contrasts with the user's chosen fill; otherwise keep label colors.
+    UIColor *titleColor = [UIColor labelColor];
+    UIColor *secondaryColor = [UIColor secondaryLabelColor];
+    ApolloLPCustomCardTextColors(&titleColor, &secondaryColor);
+    ApolloLPSetTextNodeAttributedTextIfChanged(siteNode, ApolloLPAttributedString([siteName uppercaseString], [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold], secondaryColor));
+    ApolloLPSetTextNodeAttributedTextIfChanged(titleNode, ApolloLPAttributedString(ApolloLPDisplayTitleForPreview(preview), [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold], titleColor));
+    ApolloLPSetTextNodeAttributedTextIfChanged(descriptionNode, ApolloLPAttributedString(ApolloLPDisplayDescriptionForPreview(preview), [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular], secondaryColor));
 
     return bundle;
 }
@@ -1772,7 +2008,9 @@ static id ApolloLPBuildCompactCardSpec(ASDisplayNode *hostNode, NSURL *url, Apol
     [[textStack style] setValue:@1.0 forKey:@"flexShrink"];
 
     NSMutableArray *rowChildren = [NSMutableArray array];
-    if (preview.imageURL.absoluteString.length > 0) {
+    // Dead-marked images (V21) render text-only — an 84pt square that will
+    // never load is just a blank box next to the title.
+    if (preview.imageURL.absoluteString.length > 0 && !ApolloLPImageURLIsDead(preview.imageURL)) {
         imageNode.contentMode = UIViewContentModeScaleAspectFill;
         imageNode.cornerRadius = 8.0;
         ApolloLPApplyStyleSize([imageNode style], CGSizeMake(84.0, 84.0));
@@ -1823,7 +2061,9 @@ static id ApolloLPBuildHeroCardSpec(ASDisplayNode *hostNode, NSURL *url, ApolloL
     NSUInteger descriptionLineCount = ApolloLPHeroDescriptionLineCount(preview);
     titleNode.maximumNumberOfLines = 2;
     descriptionNode.maximumNumberOfLines = descriptionLineCount;
-    ApolloLPSetTextNodeAttributedTextIfChanged(titleNode, ApolloLPAttributedString(ApolloLPDisplayTitleForPreview(preview), [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold], [UIColor labelColor]));
+    UIColor *heroTitleColor = [UIColor labelColor];
+    ApolloLPCustomCardTextColors(&heroTitleColor, NULL);
+    ApolloLPSetTextNodeAttributedTextIfChanged(titleNode, ApolloLPAttributedString(ApolloLPDisplayTitleForPreview(preview), [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold], heroTitleColor));
     ApolloLPApplyCardBackgroundColor(hostNode, backgroundNode, url, NO);
     backgroundNode.cornerRadius = 10.0;
     backgroundNode.clipsToBounds = YES;
@@ -1926,7 +2166,16 @@ static id ApolloLPBuildBlueskyPostCardSpec(ASDisplayNode *hostNode, NSURL *url, 
 
     NSString *displayName = preview.authorDisplayName.length > 0 ? preview.authorDisplayName : (ApolloLPDisplayTitleForPreview(preview).length > 0 ? ApolloLPDisplayTitleForPreview(preview) : @"Bluesky");
     NSString *handleText = ApolloLPBlueskyHandleText(preview);
-    NSString *postText = preview.postText.length > 0 ? ApolloLPCleanDisplayText(preview.postText) : ApolloLPDisplayDescriptionForPreview(preview);
+    // Keep the post's own paragraph breaks — squashing them reads terribly
+    // for multi-line posts. Bluesky posts are capped at ~300 chars, so the
+    // body is naturally bounded even without a line limit.
+    NSString *postText = preview.postText.length > 0 ? ApolloLPCleanMultilineDisplayText(preview.postText) : ApolloLPCleanMultilineDisplayText(preview.desc);
+    NSUInteger bodyNewlines = postText.length > 0 ? [postText componentsSeparatedByString:@"\n"].count - 1 : 0;
+    NSUInteger rawNewlines = preview.postText.length > 0 ? [preview.postText componentsSeparatedByString:@"\n"].count - 1 : 0;
+    ApolloLPLogOncePerHost(ApolloLPHost(url),
+        [NSString stringWithFormat:@"V19-bluesky-body source=%@ len=%lu newlines=%lu rawNewlines=%lu",
+         preview.postText.length > 0 ? @"postText" : @"desc",
+         (unsigned long)postText.length, (unsigned long)bodyNewlines, (unsigned long)rawNewlines]);
     BOOL imageIsAvatar = preview.avatarURL.absoluteString.length > 0
         && [preview.imageURL.absoluteString isEqualToString:preview.avatarURL.absoluteString];
     BOOL hasPostImage = preview.imageURL.absoluteString.length > 0 && !imageIsAvatar && !preview.imageIsFallbackIcon;
@@ -1959,7 +2208,9 @@ static id ApolloLPBuildBlueskyPostCardSpec(ASDisplayNode *hostNode, NSURL *url, 
 
     titleNode.maximumNumberOfLines = 1;
     siteNode.maximumNumberOfLines = 1;
-    descriptionNode.maximumNumberOfLines = 10;
+    // No line cap: let the card grow to fit the whole post, like the native
+    // tweet card does.
+    descriptionNode.maximumNumberOfLines = 0;
     ApolloLPSetTextNodeAttributedTextIfChanged(titleNode, ApolloLPAttributedString(displayName, [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold], [UIColor labelColor]));
     ApolloLPSetTextNodeAttributedTextIfChanged(siteNode, ApolloLPAttributedString(handleText, [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular], [UIColor secondaryLabelColor]));
     ApolloLPSetTextNodeAttributedTextIfChanged(descriptionNode, ApolloLPAttributedString(postText, [UIFont systemFontOfSize:15.0 weight:UIFontWeightRegular], [UIColor labelColor]));
@@ -2533,6 +2784,14 @@ static void ApolloLPTriggerRelayoutForHost(ASDisplayNode *node, NSString *host) 
     ApolloLPTriggerRelayoutInternal(node, YES, host);
 }
 
+// V20: when a placeholder shrinks to a compact card while the node is still
+// detached (cell measured off-tree — the common case for fresh feed cells),
+// BOTH reload attempts below miss ("row-reload-miss no-scroll-cell") and the
+// row keeps its tall hero-placeholder height around a small compact card.
+// Geometry can't detect this oversize case (a card shorter than its cell is
+// normal), so remember the failure on the node (kApolloLPPendingRowReloadHostKey,
+// declared with the dead-image helpers) and re-fire the reload from
+// didEnterVisibleState once the cell actually exists on screen.
 static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSString *host, ApolloLPContext fromContext, ApolloLPContext toContext) {
     if (!node) return;
 
@@ -2540,7 +2799,9 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
               host ?: @"(nohost)", ApolloLPContextLogName(fromContext), ApolloLPContextLogName(toContext));
     ApolloLPTriggerRelayoutInternal(node, NO, host);
     ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(node);
-    ApolloLPInvokeRowReloadIfPossible(cellNode ?: node, host);
+    if (!ApolloLPInvokeRowReloadIfPossible(cellNode ?: node, host)) {
+        objc_setAssociatedObject(node, &kApolloLPPendingRowReloadHostKey, host ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+    }
 
     __weak ASDisplayNode *weakNode = node;
     NSString *hostCopy = [host copy];
@@ -2548,7 +2809,79 @@ static void ApolloLPTriggerPlaceholderContextRelayout(ASDisplayNode *node, NSStr
         ASDisplayNode *strongNode = weakNode;
         if (!strongNode) return;
         ASDisplayNode *strongCellNode = ApolloLPFindOwningCellNode(strongNode);
-        ApolloLPInvokeRowReloadIfPossible(strongCellNode ?: strongNode, hostCopy);
+        if (ApolloLPInvokeRowReloadIfPossible(strongCellNode ?: strongNode, hostCopy)) {
+            objc_setAssociatedObject(strongNode, &kApolloLPPendingRowReloadHostKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        } else {
+            objc_setAssociatedObject(strongNode, &kApolloLPPendingRowReloadHostKey, hostCopy ?: @"?", OBJC_ASSOCIATION_COPY_NONATOMIC);
+        }
+    });
+}
+
+// MARK: - V18: stale row-height fix for late twitter/bsky card content
+//
+// When a link card's real content lands after the owning cell was measured
+// (slow TweetBuddy / Bluesky fetches), the card redraws at full size but the
+// feed row keeps its placeholder height — the card bleeds over the post's
+// footer. The relayout triggers above are no-ops in the common failure mode
+// because the LinkButtonNode is still detached (supernode == nil) while the
+// cell is measured off-tree, so no owning cell can be found at refresh time.
+// Instead of trusting the triggers, verify geometry after the fact: if the
+// card's rendered content sticks out the bottom of its row's cell view,
+// reload that row. Pure geometry — healthy rows are never reloaded.
+static void ApolloLPRunOverflowHeightCheck(ASDisplayNode *node, NSString *host, NSInteger remainingAttempts) {
+    if (!node) return;
+    @try {
+        BOOL loaded = [node respondsToSelector:@selector(isNodeLoaded)] && [node isNodeLoaded];
+        UIView *nodeView = loaded ? ApolloLPViewForNode(node) : nil;
+        UIView *cellView = nil;
+        if (nodeView.window) {
+            for (UIView *current = nodeView; current; current = current.superview) {
+                if ([current isKindOfClass:[UITableViewCell class]] ||
+                    [current isKindOfClass:[UICollectionViewCell class]]) {
+                    cellView = current;
+                    break;
+                }
+            }
+        }
+        if (!cellView) {
+            // Node not on screen (yet) — retry briefly in case it is mid-attach.
+            if (remainingAttempts > 0) {
+                __weak ASDisplayNode *weakNode = node;
+                NSString *hostCopy = [host copy];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)),
+                               dispatch_get_main_queue(), ^{
+                    ASDisplayNode *strongNode = weakNode;
+                    if (strongNode) ApolloLPRunOverflowHeightCheck(strongNode, hostCopy, remainingAttempts - 1);
+                });
+            }
+            return;
+        }
+
+        // Views don't clip by default, so a stale row shows content drawn
+        // beyond the node's frame — include one level of subview frames.
+        CGRect content = nodeView.bounds;
+        for (UIView *subview in nodeView.subviews) {
+            content = CGRectUnion(content, subview.frame);
+        }
+        CGRect frameInCell = [nodeView convertRect:content toView:cellView];
+        CGFloat overflow = CGRectGetMaxY(frameInCell) - CGRectGetHeight(cellView.bounds);
+        if (overflow > 8.0) {
+            ApolloLog(@"[LinkPreviews] V18-stale-row-height host=%@ overflow=%.0fpt -> reloading row",
+                      host ?: @"?", overflow);
+            ApolloLPInvokeRowReloadIfPossible(node, host);
+        }
+    } @catch (__unused NSException *exception) {}
+}
+
+// Let layout settle before measuring; runs on main.
+static void ApolloLPScheduleOverflowHeightCheck(ASDisplayNode *node, NSString *host) {
+    if (!node) return;
+    __weak ASDisplayNode *weakNode = node;
+    NSString *hostCopy = [host copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        ASDisplayNode *strongNode = weakNode;
+        if (strongNode) ApolloLPRunOverflowHeightCheck(strongNode, hostCopy, 1);
     });
 }
 
@@ -2570,6 +2903,12 @@ static ASDisplayNode *ApolloLPNodeForViewIfPossible(UIView *view) {
 static NSUInteger ApolloLPRecolorLinkPreviewBackgroundsForNode(ASDisplayNode *node) {
     if (!node) return 0;
 
+    // Resolve the text ink that matches the (possibly just-changed) card color
+    // up front — it depends only on the global hex, not on any single bundle.
+    UIColor *titleColor = [UIColor labelColor];
+    UIColor *secondaryColor = [UIColor secondaryLabelColor];
+    ApolloLPCustomCardTextColors(&titleColor, &secondaryColor);
+
     NSUInteger recolored = 0;
     NSDictionary<NSString *, NSDictionary *> *bundles = objc_getAssociatedObject(node, &kApolloLinkPreviewNodesKey);
     if ([bundles isKindOfClass:[NSDictionary class]]) {
@@ -2579,6 +2918,11 @@ static NSUInteger ApolloLPRecolorLinkPreviewBackgroundsForNode(ASDisplayNode *no
             NSURL *url = bundle[@"url"];
             if (![url isKindOfClass:[NSURL class]]) continue;
             if (ApolloLPApplyCardBackgroundColor(node, backgroundNode, url, YES)) {
+                // Background changed — bring the text ink along so it keeps
+                // contrasting with the new fill (or reverts to label colors).
+                ApolloLPRecolorTextNode(bundle[@"site"], secondaryColor);
+                ApolloLPRecolorTextNode(bundle[@"title"], titleColor);
+                ApolloLPRecolorTextNode(bundle[@"description"], secondaryColor);
                 recolored++;
             }
         }
@@ -2976,10 +3320,10 @@ static NSString *ApolloLPVariant(ApolloLPArea area, NSInteger mode, ApolloLPCont
 
 static NSString *ApolloLPRenderSignature(NSURL *url, ApolloLinkPreview *preview, NSString *variant) {
     CGSize imageSize = preview.imageSize;
-    return [NSString stringWithFormat:@"%@|%@|%ld|%@|%@|%@|%@|%@|%@|%@|%@|%@|%.1fx%.1f|%d",
+    return [NSString stringWithFormat:@"%@|%@|%lu|%@|%@|%@|%@|%@|%@|%@|%@|%@|%.1fx%.1f|%d",
             variant ?: @"",
             url.absoluteString ?: @"",
-            (long)sLinkPreviewCardColor,
+            (unsigned long)sLinkPreviewCardColorPacked,
             ApolloLPDisplayTitleForPreview(preview) ?: @"",
             ApolloLPDisplayDescriptionForPreview(preview) ?: @"",
             ApolloLPCleanDisplayText(preview.siteName) ?: @"",
@@ -3056,15 +3400,6 @@ static ApolloLinkPreview *ApolloLPPreviewByApplyingTranslation(ASDisplayNode *ho
     return displayPreview;
 }
 
-static ASLayoutSpec *ApolloLPEmptyLayoutSpec(void) {
-    Class layoutSpecCls = ApolloLPClass(@"ASLayoutSpec");
-    if (!layoutSpecCls) return nil;
-
-    ASLayoutSpec *empty = [[layoutSpecCls alloc] init];
-    ApolloLPApplyStyleSize([empty style], CGSizeZero);
-    return empty;
-}
-
 static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL *url, id nativeSpec) {
     NSString *redditUsername = ApolloLPRedditUsernameFromProfileURL(url);
     if (redditUsername.length == 0 || !ApolloBannedProfileCachedIsSuspended(redditUsername)) {
@@ -3114,10 +3449,15 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
         }
     }
     if (ApolloLPIsImageChestAlbumURL(url)) {
-        ApolloLPLogOncePerHost(host, @"suppress-imagechest-card");
+        // #552: defer to the inline-image album renderer (ApolloInlineImages'
+        // LinkButtonNode hook) instead of suppressing to empty. Suppressing left
+        // ImgChest album LINK POSTS blank — the inline-image album only rendered
+        // for in-text links, never a bare link post, so nothing filled the space.
+        // Deferring lets the album cover render (or the native card show as a
+        // placeholder / failure fallback) regardless of hook load order.
+        ApolloLPLogOncePerHost(host, @"defer-imagechest-album");
         ApolloLPRestoreHostShell((ASDisplayNode *)self);
-        ASLayoutSpec *empty = ApolloLPEmptyLayoutSpec();
-        return empty ?: %orig;
+        return %orig;
     }
 
     NSInteger selectedMode = ApolloLPModeForArea(area);
@@ -3140,7 +3480,11 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     ApolloLPInstallContextMenuForNode((ASDisplayNode *)self, url);
 
     ApolloLinkPreview *cached = [[ApolloLinkPreviewCache sharedCache] cachedPreviewForURL:url];
-    if (cached && ApolloLPIsBlueskyPostURL(url) && !ApolloLPIsBlueskyPostPreview(url, cached)) {
+    // Match the fetcher's staleness rule: a bsky-post preview without
+    // postText renders its flattened desc as the body, so refetch it rather
+    // than reuse it forever (the render gate alone accepts handle-only).
+    if (cached && ApolloLPIsBlueskyPostURL(url) &&
+        (!ApolloLPIsBlueskyPostPreview(url, cached) || cached.postText.length == 0)) {
         ApolloLPLogOncePerHost(host, @"stale-bluesky-inline-refetch");
         cached = nil;
     }
@@ -3220,6 +3564,36 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     ApolloLinkPreview *displayPreview = (isRedditUser || isRedditSubreddit) ? cached : ApolloLPPreviewByApplyingTranslation((ASDisplayNode *)self, url, cached);
     BOOL isBlueskyPost = ApolloLPIsBlueskyPostPreview(url, displayPreview);
     ApolloLPContext context = isBlueskyPost ? ApolloLPContextSelfText : ((isRedditUser || isRedditSubreddit) ? ApolloLPContextCompact : ApolloLPContextForMode(selectedMode, displayPreview));
+
+    // Multi-link comment collapse: in Full mode, a single comment that contains
+    // 2+ eligible preview links would otherwise stack that many tall hero cards,
+    // making the comment absurdly long. When this would-be hero card lives in a
+    // comment with 2+ eligible links, render it compact instead. Single-link
+    // comments keep their full hero card; post bodies/selftext are unaffected
+    // (this only applies to the Comments area). Reddit user/subreddit/Bluesky
+    // cards keep their own fixed context and are excluded above.
+    if (area == ApolloLPAreaComments && selectedMode == ApolloLinkPreviewModeFull &&
+        context == ApolloLPContextSelfText && !isBlueskyPost && !isRedditUser && !isRedditSubreddit) {
+        ASDisplayNode *cell = ApolloLPEnclosingCellNode((ASDisplayNode *)self);
+        if (cell) {
+            NSUInteger linkCount = ApolloLPCountEligiblePreviewLinksInTree(cell);
+            if (linkCount >= 2) {
+                context = ApolloLPContextCompact;
+                ApolloLPLogOncePerHost(host, @"multi-link-collapse-compact");
+            }
+        }
+    }
+
+    // V21: the preview scraped an image URL but the file 404s (clip hosts
+    // publish og:image before the thumbnail exists). Render compact instead
+    // of a hero with a dead image area; the mark expires (5 min) so the card
+    // upgrades itself once the host generates the thumbnail.
+    if (context == ApolloLPContextSelfText && !isBlueskyPost && !isRedditUser && !isRedditSubreddit &&
+        ApolloLPImageURLIsDead(displayPreview.imageURL)) {
+        context = ApolloLPContextCompact;
+        ApolloLPLogOncePerHost(host, @"V21-dead-image-compact");
+    }
+
     ApolloLPLogMetadataOnce(host, displayPreview, area, selectedMode, context);
     if (!isBlueskyPost && !isRedditUser && !isRedditSubreddit && displayPreview.imageIsFallbackIcon) {
         ApolloLPRememberCompactPlaceholderHost(url);
@@ -3256,6 +3630,10 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
                 } else {
                     ApolloLPTriggerRelayoutForHost(strongSelf, hostCopy);
                 }
+                // V18: the trigger above is a no-op when this node is still
+                // detached (cell measured off-tree); verify the row height by
+                // geometry once things settle.
+                ApolloLPScheduleOverflowHeightCheck(strongSelf, hostCopy);
             });
         }
         ApolloLPClearHostShell((ASDisplayNode *)self);
@@ -3284,11 +3662,49 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
     }
 }
 
+// V18: cards whose final content rendered while the node was detached could
+// never fix their row height (no owning cell at refresh time). Verify the
+// geometry whenever the card scrolls on screen; only broken rows reload.
+// V20: also re-fire a placeholder-shrink row reload that failed while the
+// node was detached — the oversized-row case geometry can't detect.
+- (void)didEnterVisibleState {
+    %orig;
+    NSString *pendingHost = objc_getAssociatedObject(self, &kApolloLPPendingRowReloadHostKey);
+    if (pendingHost) {
+        objc_setAssociatedObject(self, &kApolloLPPendingRowReloadHostKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        ApolloLog(@"[LinkPreviews] V20-deferred-row-reload host=%@", pendingHost);
+        __weak ASDisplayNode *weakSelf = (ASDisplayNode *)self;
+        // Let the cell finish attaching before resolving its index path.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(50 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            ASDisplayNode *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            ASDisplayNode *cellNode = ApolloLPFindOwningCellNode(strongSelf);
+            ApolloLPInvokeRowReloadIfPossible(cellNode ?: strongSelf, pendingHost);
+        });
+    }
+    ApolloLPScheduleOverflowHeightCheck((ASDisplayNode *)self, @"visible-check");
+}
+
 %end
 
-// V17: pre-stamp area on link buttons inside comment cells so the first
+// V18: Apollo's native tweet card (data via the TweetBuddy shim) hits the
+// same stale-row-height race when the tweet arrives after the row was
+// measured — the info node materializes late and bleeds over the footer.
+// Its didLoad is the earliest point with real geometry; the overflow check
+// keeps healthy rows untouched.
+%hook _TtC6Apollo23LinkButtonTweetInfoNode
+
+- (void)didLoad {
+    %orig;
+    ApolloLPScheduleOverflowHeightCheck((ASDisplayNode *)self, @"tweet-info");
+}
+
+%end
+
+// V17: pre-stamp area on link buttons inside a cell so the first
 // background-thread measurement of a freshly-recreated cell (e.g. after a
-// vote) does not race the supernode chain attachment.
+// vote) does not race the supernode chain attachment. Comment cells stamp
+// Comments; the OP-selftext header and feed post cells stamp Body (issue #318).
 %hook _TtC6Apollo15CommentCellNode
 - (void)didLoad {
     %orig;
@@ -3299,7 +3715,21 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
 %hook _TtC6Apollo22CommentsHeaderCellNode
 - (void)didLoad {
     %orig;
-    ApolloLPStampLinkButtonAreaInTree((ASDisplayNode *)self, ApolloLPAreaComments);
+    ApolloLPStampLinkButtonAreaInTree((ASDisplayNode *)self, ApolloLPAreaBody);
+}
+%end
+
+%hook _TtC6Apollo17LargePostCellNode
+- (void)didLoad {
+    %orig;
+    ApolloLPStampLinkButtonAreaInTree((ASDisplayNode *)self, ApolloLPAreaBody);
+}
+%end
+
+%hook _TtC6Apollo19CompactPostCellNode
+- (void)didLoad {
+    %orig;
+    ApolloLPStampLinkButtonAreaInTree((ASDisplayNode *)self, ApolloLPAreaBody);
 }
 %end
 
@@ -3329,17 +3759,5 @@ static id ApolloLPNativeLinkSpecWithBannedHintIfNeeded(id linkButtonNode, NSURL 
         }
     }];
 
-    ApolloLog(@"[LinkPreviews] ctor: hook installed for _TtC6Apollo14LinkButtonNode bodyMode=%ld commentsMode=%ld cardColor=%ld", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, (long)sLinkPreviewCardColor);
-    ApolloLog(@"[LinkPreviews] V5 polish active");
-    ApolloLog(@"[LinkPreviews] V6 image-kind polish active");
-    ApolloLog(@"[LinkPreviews] V7 display modes and placeholders active");
-    ApolloLog(@"[LinkPreviews] V8 borderless cards active");
-    ApolloLog(@"[LinkPreviews] V9 split body/comment modes active");
-    ApolloLog(@"[LinkPreviews] V10 preview text restore active");
-    ApolloLog(@"[LinkPreviews] V11 hero-card stability and naked-URL hiding active");
-    ApolloLog(@"[LinkPreviews] V13 preset card colors and instant color refresh active");
-    ApolloLog(@"[LinkPreviews] V12 cleanup hero sizing active");
-    ApolloLog(@"[LinkPreviews] V12 hero image ratio cap 0.6 + nature/client-challenge bypass active");
-    ApolloLog(@"[LinkPreviews] V14 translation-aware metadata text active");
-    ApolloLog(@"[LinkPreviews] V15 targeted translation refresh active");
+    ApolloLog(@"[LinkPreviews] ctor: hook installed for _TtC6Apollo14LinkButtonNode bodyMode=%ld commentsMode=%ld cardColorHex=%@", (long)sLinkPreviewBodyMode, (long)sLinkPreviewCommentsMode, sLinkPreviewCardColorHex ?: @"(default)");
 }

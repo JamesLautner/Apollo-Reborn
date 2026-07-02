@@ -112,12 +112,26 @@ static NSString *ApolloLinkPreviewDecodeCommonNamedEntities(NSString *string) {
     clean = [clean stringByReplacingOccurrencesOfString:@"&bdquo;" withString:@"\""];
     clean = [clean stringByReplacingOccurrencesOfString:@"&ndash;" withString:@"-"];
     clean = [clean stringByReplacingOccurrencesOfString:@"&mdash;" withString:@"-"];
-    clean = [clean stringByReplacingOccurrencesOfString:@"&hellip;" withString:@"..."];
+    clean = [clean stringByReplacingOccurrencesOfString:@"&hellip;" withString:@"…"];
+    // Guillemets (« »), common in Italian/French news headlines (e.g. il messaggero),
+    // were passing through raw into preview cards.
+    clean = [clean stringByReplacingOccurrencesOfString:@"&laquo;" withString:@"«"];
+    clean = [clean stringByReplacingOccurrencesOfString:@"&raquo;" withString:@"»"];
+    clean = [clean stringByReplacingOccurrencesOfString:@"&deg;" withString:@"°"];
+    clean = [clean stringByReplacingOccurrencesOfString:@"&euro;" withString:@"€"];
     clean = [clean stringByReplacingOccurrencesOfString:@"&lt;" withString:@"<"];
     clean = [clean stringByReplacingOccurrencesOfString:@"&gt;" withString:@">"];
     // &amp; last so we don't double-decode embedded entities.
     clean = [clean stringByReplacingOccurrencesOfString:@"&amp;" withString:@"&"];
     return clean;
+}
+
+// Public entity-decode entry point (named + numeric only — no whitespace/tag
+// normalization, since display-time callers handle that). Shared with the link-card
+// render path in ApolloInlineLinkPreviews so cached/translated titles decode too.
+NSString *ApolloLinkPreviewDecodeEntities(NSString *string) {
+    if (![string isKindOfClass:[NSString class]]) return string;
+    return ApolloLinkPreviewDecodeCommonNamedEntities(ApolloLinkPreviewDecodeNumericEntities(string));
 }
 
 static NSString *ApolloLinkPreviewCleanString(NSString *string) {
@@ -810,7 +824,12 @@ static NSString *ApolloLinkPreviewBrowserUserAgent(void) {
 
 + (void)finishURL:(NSURL *)url preview:(ApolloLinkPreview *)preview {
     if (!preview) {
-        ApolloLog(@"[LinkPreviews] no cache for empty preview host=%@", ApolloLinkPreviewHost(url));
+        // Negatively cache the failure so the next layout resolves from cache
+        // instead of refetching. Without this, a URL that always 404s (e.g. a
+        // removed v.redd.it video surfaced as a redd.it/<id> short link) loops
+        // forever: fetch fails -> node relayouts -> refetches, freezing scroll.
+        ApolloLog(@"[LinkPreviews] caching negative result for empty preview host=%@", ApolloLinkPreviewHost(url));
+        [[ApolloLinkPreviewCache sharedCache] markNoMetadataForURL:url];
         NSString *key = url.absoluteString ?: @"";
         dispatch_async(ApolloLinkPreviewFetcherQueue(), ^{
             NSMutableArray *completions = ApolloLinkPreviewPendingFetches()[key];
@@ -1229,7 +1248,10 @@ static NSString *ApolloLinkPreviewBrowserUserAgent(void) {
             ApolloLinkPreview *preview = [ApolloLinkPreview new];
             preview.siteName = @"Bluesky";
             preview.title = title;
-            preview.desc = ApolloLinkPreviewTruncatedString(text, 300);
+            // Keep the post's paragraph breaks in desc too — it's the body
+            // the Bluesky card falls back to, and newlines are part of how
+            // the post reads. (TruncatedString would flatten them.)
+            preview.desc = text.length > 300 ? [[text substringToIndex:300] stringByAppendingString:@"..."] : text;
             preview.previewKind = @"bluesky-post-v2";
             preview.authorDisplayName = displayName;
             preview.authorHandle = handle;

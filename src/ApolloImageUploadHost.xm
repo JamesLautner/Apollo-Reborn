@@ -10,8 +10,24 @@
 #import "ApolloCommon.h"
 #import "ApolloRedditMediaUpload.h"
 #import "ApolloImageUploadHost.h"
+#import "ApolloImgChestUpload.h"
+#import "ApolloMarkdownToolbarGif.h"
 #import "ApolloMediaMetadata.h"
 #import "ApolloState.h"
+
+// Defined (extern "C") in ApolloChatComposer.xm: YES while a chat photo upload is in flight, so we
+// route it to ImgChest regardless of the global Media Upload Host (Reddit can't host PM images).
+// ApolloChatClearImageUpload() closes that window the moment we consume it here, so the routing can't
+// leak onto a later non-chat upload.
+#ifdef __cplusplus
+extern "C" {
+#endif
+BOOL ApolloChatImageUploadPending(void);
+void ApolloChatClearImageUpload(void);
+#ifdef __cplusplus
+}
+#endif
+#import "ApolloWebJSON.h"
 #import "Defaults.h"
 #import "fishhook.h"
 
@@ -184,7 +200,7 @@ static UIViewController *ApolloRedditVisibleControllerFromController(UIViewContr
 }
 
 static UIAlertController *ApolloRedditActiveUploadingAlert(void) {
-    for (UIWindow *window in [UIApplication.sharedApplication.windows reverseObjectEnumerator]) {
+    for (UIWindow *window in [ApolloAllWindows() reverseObjectEnumerator]) {
         if (window.hidden || window.alpha < 0.01) continue;
         UIViewController *visible = ApolloRedditVisibleControllerFromController(window.rootViewController);
         UIAlertController *alert = [visible isKindOfClass:[UIAlertController class]] ? (UIAlertController *)visible : nil;
@@ -269,6 +285,11 @@ void ApolloRedditCaptureBearerTokenFromAuthorization(NSString *authorization, NS
 
     NSString *token = [[authorization substringFromIndex:NSMaxRange(bearerRange)] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (token.length == 0 || [token isEqualToString:sLatestRedditBearerToken]) return;
+    // The Web JSON identity layer installs a synthetic bearer so Apollo issues
+    // requests without real keys; it's a placeholder, not a usable oauth token,
+    // so don't let it overwrite a real captured token (the chokepoint replaces
+    // it with the cookie before it reaches Reddit anyway).
+    if ([token isEqualToString:ApolloWebJSONSyntheticBearerToken]) return;
 
     sLatestRedditBearerToken = [token copy];
     ApolloLog(@"[RedditUpload] Captured Reddit bearer token from %@", source ?: @"unknown source");
@@ -542,7 +563,11 @@ static NSUInteger ApolloSubmitFirstTrimmedValueLength(NSDictionary<NSString *, N
 }
 
 static NSString *ApolloMediaPostBodyProviderName(void) {
-    return sImageUploadProvider == ImageUploadProviderReddit ? @"reddit" : @"imgur";
+    switch (sImageUploadProvider) {
+        case ImageUploadProviderReddit:   return @"reddit";
+        case ImageUploadProviderImgChest: return @"imgchest";
+        default:                          return @"imgur";
+    }
 }
 
 static void ApolloMediaPostBodyLogSubmitDecision(NSString *stage, NSDictionary<NSString *, NSArray<NSString *> *> *formValues, NSString *composerBodyText, BOOL hostedMedia, NSString *skipReason) {
@@ -931,13 +956,25 @@ static NSData *ApolloRedditRichTextJSONDataForText(NSString *text);
 
 // MARK: - Request identification
 
+// Reddit write requests normally go to oauth.reddit.com, but in Web JSON mode the
+// chokepoint (ApolloWebJSONRewriteRequest) re-points them at www.reddit.com with
+// cookie+modhash auth. So the request-identification below must accept BOTH hosts,
+// or the comment/submit/upload response post-processing (rich-text injection,
+// asset tracking, permalink resolution) silently no-ops in Web JSON mode. The
+// www.reddit.com form only ever occurs under Web JSON, so this is additive — it
+// doesn't change behavior for the API-key path.
+static BOOL ApolloIsRedditWriteHost(NSURL *url) {
+    NSString *host = url.host;
+    return [host isEqualToString:@"oauth.reddit.com"] || [host isEqualToString:@"www.reddit.com"];
+}
+
 // Matches /api/comment (new comments) and /api/editusertext (edits to existing
 // comments and self-text post bodies). Both accept the same form fields and return
 // the same envelope.
 static BOOL ApolloIsRedditCommentRequest(NSURLRequest *request) {
     if (![request isKindOfClass:[NSURLRequest class]]) return NO;
     NSURL *url = request.URL;
-    if (![url.host isEqualToString:@"oauth.reddit.com"]) return NO;
+    if (!ApolloIsRedditWriteHost(url)) return NO;
     NSString *path = url.path;
     return [path isEqualToString:@"/api/comment"]
         || [path isEqualToString:@"/api/editusertext"]
@@ -947,7 +984,7 @@ static BOOL ApolloIsRedditCommentRequest(NSURLRequest *request) {
 static BOOL ApolloIsRedditSubmitRequest(NSURLRequest *request) {
     if (![request isKindOfClass:[NSURLRequest class]]) return NO;
     NSURL *url = request.URL;
-    return [url.host isEqualToString:@"oauth.reddit.com"] &&
+    return ApolloIsRedditWriteHost(url) &&
         ([url.path isEqualToString:@"/api/submit"] ||
          [url.path isEqualToString:@"/api/submit_gallery_post"] ||
          [url.path isEqualToString:@"/api/submit_gallery_post.json"]);
@@ -956,13 +993,13 @@ static BOOL ApolloIsRedditSubmitRequest(NSURLRequest *request) {
 static BOOL ApolloIsRedditLegacySubmitRequest(NSURLRequest *request) {
     if (![request isKindOfClass:[NSURLRequest class]]) return NO;
     NSURL *url = request.URL;
-    return [url.host isEqualToString:@"oauth.reddit.com"] && [url.path isEqualToString:@"/api/submit"];
+    return ApolloIsRedditWriteHost(url) && [url.path isEqualToString:@"/api/submit"];
 }
 
 static BOOL ApolloIsRedditGallerySubmitRequest(NSURLRequest *request) {
     if (![request isKindOfClass:[NSURLRequest class]]) return NO;
     NSURL *url = request.URL;
-    return [url.host isEqualToString:@"oauth.reddit.com"] &&
+    return ApolloIsRedditWriteHost(url) &&
         ([url.path isEqualToString:@"/api/submit_gallery_post"] || [url.path isEqualToString:@"/api/submit_gallery_post.json"]);
 }
 
@@ -1158,6 +1195,53 @@ static NSURLRequest *ApolloRedditGallerySubmitRequestFromForm(NSURLRequest *requ
 
 // MARK: - Request rewriting (submit)
 
+// ImgChest album submit fix (issue #552). Our album responder combines the member
+// uploads into one ImgChest post and hands Apollo a synthetic Imgur album response
+// whose id is the ImgChest post id. Apollo's createAlbum then rebuilds the post link
+// as https://imgur.com/a/<id> — keeping our ImgChest post id but swapping the host to
+// imgur.com, so the submitted link is a dead Imgur album. Rewrite the submit's `url`
+// field back to the real imgchest.com/p/<id> post (and inject composer body text if
+// supplied, mirroring the Imgur path). Single-image ImgChest posts submit the CDN link
+// directly, so ApolloImgurAlbumIDFromURLString returns nil for them and they pass
+// through untouched. Returns nil when nothing applied.
+static NSURLRequest *ApolloImgChestRewriteSubmitRequest(NSURLRequest *request, NSArray<NSString *> *pairs, NSString *bodyTextToInject) {
+    NSMutableArray<NSString *> *rewrittenPairs = [NSMutableArray arrayWithCapacity:pairs.count + 1];
+    BOOL changed = NO;
+    BOOL wroteText = NO;
+    NSString *rewrittenURL = nil;
+    for (NSString *pair in pairs) {
+        NSRange equals = [pair rangeOfString:@"="];
+        NSString *key = ApolloFormDecodeComponent(equals.location == NSNotFound ? pair : [pair substringToIndex:equals.location]);
+        NSString *value = ApolloFormDecodeComponent(equals.location == NSNotFound ? @"" : [pair substringFromIndex:equals.location + 1]);
+        if ([key isEqualToString:@"url"]) {
+            NSString *albumID = ApolloImgurAlbumIDFromURLString(value);
+            NSURL *imgChestURL = albumID.length > 0 ? ApolloImgChestPostURLForAlbumID(albumID) : nil;
+            if (imgChestURL.absoluteString.length > 0 && ![imgChestURL.absoluteString isEqualToString:value]) {
+                value = imgChestURL.absoluteString;
+                rewrittenURL = value;
+                changed = YES;
+            }
+        } else if ([key isEqualToString:@"text"] && bodyTextToInject.length > 0 && ApolloTrimmedString(value).length == 0) {
+            value = bodyTextToInject;
+            wroteText = YES;
+            changed = YES;
+        }
+        [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(key), ApolloFormEncodeComponent(value)]];
+    }
+    if (bodyTextToInject.length > 0 && !wroteText) {
+        [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"text"), ApolloFormEncodeComponent(bodyTextToInject)]];
+        changed = YES;
+    }
+    if (!changed) return nil;
+
+    NSMutableURLRequest *modified = [request mutableCopy];
+    NSData *newBody = [[rewrittenPairs componentsJoinedByString:@"&"] dataUsingEncoding:NSUTF8StringEncoding];
+    modified.HTTPBody = newBody;
+    [modified setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length] forHTTPHeaderField:@"Content-Length"];
+    if (rewrittenURL.length > 0) ApolloLog(@"[ImgChestUpload] Rewrote multi-image submit url to ImgChest album %@", rewrittenURL);
+    return modified;
+}
+
 NSURLRequest *ApolloRedditMaybeRewriteSubmitRequest(NSURLRequest *request) {
     if (!ApolloIsRedditLegacySubmitRequest(request)) return nil;
 
@@ -1187,6 +1271,16 @@ NSURLRequest *ApolloRedditMaybeRewriteSubmitRequest(NSURLRequest *request) {
     else if (hasExistingRichTextJSON) preflightSkipReason = @"existing-richtext";
     else if (!hostedMediaForm) preflightSkipReason = @"not-hosted-media-form";
     ApolloMediaPostBodyLogSubmitDecision(@"preflight", formValues, composerBodyText, hostedMediaForm, preflightSkipReason);
+
+    if (sImageUploadProvider == ImageUploadProviderImgChest) {
+        // #552: fix the imgur.com/a/<id> -> imgchest.com/p/<id> album link, and
+        // inject composer body text in the same rebuild if applicable.
+        NSURLRequest *imgChestRequest = ApolloImgChestRewriteSubmitRequest(request, pairs, shouldInjectComposerBodyText ? composerBodyText : nil);
+        if (imgChestRequest) {
+            ApolloLog(@"[MediaPostBody] Rewrote ImgChest submit (album url fix + body=%@)", shouldInjectComposerBodyText ? @"yes" : @"no");
+        }
+        return imgChestRequest;
+    }
 
     if (sImageUploadProvider != ImageUploadProviderReddit) {
         if (!shouldInjectComposerBodyText) return nil;
@@ -1414,18 +1508,185 @@ static NSString *ApolloCommentTextByWrappingRedditUploadedMediaURLs(NSString *te
     return rewritten;
 }
 
+// Rewrites bare i.redd.it media URLs into markdown image syntax `![gif|image](url)`.
+// Used alongside richtext_json so clients that don't honor RTJSON (notably the
+// official Reddit iOS app) still have a renderable body markdown fallback.
+static NSString *ApolloCommentTextByEmbeddingRedditUploadedMediaURLs(NSString *text) {
+    if (!ApolloStringContainsRedditUploadedMedia(text)) return text;
+    NSRegularExpression *regex = ApolloRedditUploadedMediaURLRegex();
+    if (!regex) return text;
+    NSArray<NSTextCheckingResult *> *matches = [regex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (matches.count == 0) return text;
+
+    NSMutableString *rewritten = [text mutableCopy];
+    for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
+        NSRange range = match.range;
+        // Skip URLs that are already inside a markdown link/image: `](url)`.
+        if (range.location >= 2 && [[text substringWithRange:NSMakeRange(range.location - 2, 2)] isEqualToString:@"]("]) continue;
+        NSString *url = [text substringWithRange:range];
+        NSString *alt = [url.lowercaseString hasSuffix:@".gif"] ? @"gif" : @"image";
+        [rewritten replaceCharactersInRange:range withString:[NSString stringWithFormat:@"![%@](%@)", alt, url]];
+    }
+    return rewritten;
+}
+
+// Matches `![gif](giphy|<id>)` markdown tokens emitted by ApolloMarkdownToolbarGif
+// for native Reddit Giphy embeds. The cached regex itself lives in
+// `ApolloMarkdownToolbarGif.xm` (declared in `ApolloMarkdownToolbarGif.h`) so
+// the toolbar, submit-rewriter, and body renderer all share one source of
+// truth for the token shape. Capture group 1 is the bare Giphy GIF ID.
+
+// Builds a Reddit RTJSON `document` mixing text paragraphs and
+// `{e:gif,id:giphy|<id>}` blocks. Returns nil if no giphy tokens are found.
+// On return, `outStrippedText` receives the original text with all giphy
+// tokens removed (trimmed) — sent as the plain `text` caption so Reddit
+// doesn't double-render the literal markdown alongside the RTJSON gifs.
+static NSData *ApolloRedditRichTextJSONDataForGiphyText(NSString *text, NSString **outStrippedText) {
+    NSRegularExpression *regex = ApolloNativeGiphyMarkdownTokenRegex();
+    if (!regex || text.length == 0) return nil;
+    NSArray<NSTextCheckingResult *> *matches = [regex matchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    if (matches.count == 0) return nil;
+
+    NSMutableArray<NSDictionary *> *blocks = [NSMutableArray array];
+    NSMutableString *stripped = [NSMutableString string];
+    NSUInteger cursor = 0;
+    for (NSTextCheckingResult *match in matches) {
+        if (match.range.location > cursor) {
+            NSString *between = [text substringWithRange:NSMakeRange(cursor, match.range.location - cursor)];
+            NSDictionary *paragraph = ApolloRedditRichTextParagraphBlock(between);
+            if (paragraph) [blocks addObject:paragraph];
+            [stripped appendString:between];
+        }
+        NSString *gifID = [text substringWithRange:[match rangeAtIndex:1]];
+        [blocks addObject:@{ @"e": @"gif", @"id": [NSString stringWithFormat:@"giphy|%@", gifID] }];
+        cursor = NSMaxRange(match.range);
+    }
+    if (cursor < text.length) {
+        NSString *tail = [text substringFromIndex:cursor];
+        NSDictionary *paragraph = ApolloRedditRichTextParagraphBlock(tail);
+        if (paragraph) [blocks addObject:paragraph];
+        [stripped appendString:tail];
+    }
+    if (blocks.count == 0) return nil;
+    if (outStrippedText) {
+        *outStrippedText = [stripped stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+    return [NSJSONSerialization dataWithJSONObject:@{ @"document": blocks } options:0 error:nil];
+}
+
 NSURLRequest *ApolloRedditMaybeRewriteCommentRequest(NSURLRequest *request) {
     if (!ApolloIsRedditCommentRequest(request)) return nil;
 
     NSData *bodyData = request.HTTPBody;
     if (bodyData.length == 0) return nil;
     NSString *body = [[NSString alloc] initWithData:bodyData encoding:NSUTF8StringEncoding];
+
+    // Native-Giphy fast path: when `text` contains `![gif](giphy|<id>)` tokens
+    // (emitted by ApolloMarkdownToolbarGif), build a proper Reddit RTJSON
+    // document with `{e:gif,id:giphy|<id>}` blocks and replace any existing
+    // `richtext_json`. Reddit's `/api/comment` does NOT render giphy via raw
+    // markdown — it requires RTJSON. Apollo's own placeholder richtext_json
+    // is malformed for this case, which produces "Error Submitting … Code: 501".
+    //
+    // The form-encoded body encodes `(` as `%28` and `|` as `%7C`, so the
+    // unambiguous signature is "giphy" followed by either `|` (decoded) or
+    // `%7C` (encoded). Matching the literal `](giphy|` would never fire on a
+    // properly URL-encoded body and is why v3 silently no-op'd.
+    BOOL hasGiphyTokenEncoded = body.length > 0 && [body rangeOfString:@"giphy%7C" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    BOOL hasGiphyTokenDecoded = body.length > 0 && [body rangeOfString:@"giphy|" options:NSCaseInsensitiveSearch].location != NSNotFound;
+    if (hasGiphyTokenEncoded || hasGiphyTokenDecoded) {
+        ApolloLog(@"[RedditUpload] Native giphy: fast-path entered path=%@ bodyLen=%lu encoded=%@ decoded=%@",
+                  request.URL.path,
+                  (unsigned long)body.length,
+                  hasGiphyTokenEncoded ? @"yes" : @"no",
+                  hasGiphyTokenDecoded ? @"yes" : @"no");
+        NSArray<NSString *> *giphyPairs = [body componentsSeparatedByString:@"&"];
+        NSMutableArray<NSString *> *outPairs = [NSMutableArray arrayWithCapacity:giphyPairs.count + 2];
+        NSString *giphyRichTextJSONString = nil;
+        NSString *strippedText = nil;
+        BOOL wroteReturnRichTextJSON = NO;
+        BOOL replacedRichTextJSON = NO;
+        NSUInteger giphyBlockCount = 0;
+
+        // Pre-scan: locate the `text` pair (if any) and pre-compute the RTJSON
+        // document + stripped caption BEFORE the rewriting loop. The previous
+        // implementation built these inline during the `text` branch and then
+        // assumed `text` would appear before `richtext_json` in the body —
+        // which happens to be true today but isn't guaranteed by any spec.
+        // Pre-computing makes the loop order-independent and lets the
+        // `richtext_json` branch always see a non-nil replacement when one is
+        // available.
+        for (NSString *pair in giphyPairs) {
+            NSRange eq = [pair rangeOfString:@"="];
+            NSString *key = ApolloFormDecodeComponent(eq.location == NSNotFound ? pair : [pair substringToIndex:eq.location]);
+            if (![key isEqualToString:@"text"]) continue;
+            NSString *value = ApolloFormDecodeComponent(eq.location == NSNotFound ? @"" : [pair substringFromIndex:eq.location + 1]);
+            NSData *rtData = ApolloRedditRichTextJSONDataForGiphyText(value, &strippedText);
+            if (rtData.length > 0) {
+                giphyRichTextJSONString = [[NSString alloc] initWithData:rtData encoding:NSUTF8StringEncoding];
+                NSRegularExpression *r = ApolloNativeGiphyMarkdownTokenRegex();
+                giphyBlockCount = r ? [r numberOfMatchesInString:value options:0 range:NSMakeRange(0, value.length)] : 0;
+            }
+            break;
+        }
+
+        for (NSString *pair in giphyPairs) {
+            NSRange eq = [pair rangeOfString:@"="];
+            NSString *key = ApolloFormDecodeComponent(eq.location == NSNotFound ? pair : [pair substringToIndex:eq.location]);
+            NSString *value = ApolloFormDecodeComponent(eq.location == NSNotFound ? @"" : [pair substringFromIndex:eq.location + 1]);
+
+            if ([key isEqualToString:@"text"]) {
+                if (giphyRichTextJSONString.length > 0) {
+                    // Strip the literal tokens from `text` so Reddit doesn't
+                    // double-render them as markdown alongside the RTJSON gifs.
+                    value = strippedText ?: @"";
+                }
+            } else if ([key isEqualToString:@"richtext_json"] && giphyRichTextJSONString.length > 0) {
+                ApolloLog(@"[RedditUpload] Native giphy: replacing existing richtext_json (origLen=%lu, newLen=%lu)",
+                          (unsigned long)value.length, (unsigned long)giphyRichTextJSONString.length);
+                value = giphyRichTextJSONString;
+                replacedRichTextJSON = YES;
+            } else if ([key isEqualToString:@"return_rtjson"]) {
+                value = @"true";
+                wroteReturnRichTextJSON = YES;
+            }
+
+            [outPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(key), ApolloFormEncodeComponent(value)]];
+        }
+
+        if (giphyRichTextJSONString.length == 0) {
+            ApolloLog(@"[RedditUpload] Native giphy detected but no RTJSON built (text pair missing?) — leaving %@ submit untouched", request.URL.path);
+            return nil;
+        }
+
+        if (!replacedRichTextJSON) {
+            [outPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"richtext_json"), ApolloFormEncodeComponent(giphyRichTextJSONString)]];
+        }
+        if (!wroteReturnRichTextJSON) {
+            [outPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"return_rtjson"), ApolloFormEncodeComponent(@"true")]];
+        }
+
+        NSMutableURLRequest *giphyModified = [request mutableCopy];
+        NSData *newBody = [[outPairs componentsJoinedByString:@"&"] dataUsingEncoding:NSUTF8StringEncoding];
+        [giphyModified setHTTPBody:newBody];
+        [giphyModified setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length] forHTTPHeaderField:@"Content-Length"];
+        ApolloLog(@"[RedditUpload] Native giphy: rewrote %@ submit (gifBlocks=%lu, captionLen=%lu, rtjsonLen=%lu, replacedExisting=%@, %lu bytes)",
+                  request.URL.path,
+                  (unsigned long)giphyBlockCount,
+                  (unsigned long)(strippedText.length),
+                  (unsigned long)giphyRichTextJSONString.length,
+                  replacedRichTextJSON ? @"yes" : @"no",
+                  (unsigned long)newBody.length);
+        return giphyModified;
+    }
+
     if (!ApolloStringContainsRedditUploadedMedia(body)) return nil;
 
     NSArray<NSString *> *pairs = [body componentsSeparatedByString:@"&"];
     NSMutableArray<NSString *> *rewrittenPairs = [NSMutableArray arrayWithCapacity:pairs.count + 2];
     BOOL changed = NO;
     BOOL wroteReturnRichTextJSON = NO;
+    BOOL replacedExistingRichTextJSON = NO;
     NSString *richTextJSONString = nil;
 
     for (NSString *pair in pairs) {
@@ -1438,30 +1699,55 @@ NSURLRequest *ApolloRedditMaybeRewriteCommentRequest(NSURLRequest *request) {
             if (richTextJSONData.length > 0) {
                 richTextJSONString = [[NSString alloc] initWithData:richTextJSONData encoding:NSUTF8StringEncoding];
                 if (richTextJSONString.length > 0) {
-                    ApolloLog(@"[RedditUpload] Rewriting %@ text to richtext_json", request.URL.path);
+                    // Keep `text` populated alongside richtext_json: the official
+                    // Reddit iOS app renders comments from `body` markdown and shows
+                    // a blank comment when only richtext_json is provided. Rewrite
+                    // the bare i.redd.it URL to `![gif|image](url)` so all clients
+                    // (Apollo via inline-images, reddit.com via RTJSON, official app
+                    // via markdown image) display the GIF.
+                    NSString *embeddedValue = ApolloCommentTextByEmbeddingRedditUploadedMediaURLs(value);
+                    if (![embeddedValue isEqualToString:value]) {
+                        value = embeddedValue;
+                    }
+                    ApolloLog(@"[RedditUpload] Rewriting %@ text to richtext_json (kept markdown body fallback len=%lu)",
+                              request.URL.path, (unsigned long)value.length);
                     changed = YES;
-                    continue;
+                    // Fall through so the `text` pair (with markdown image syntax) is re-emitted below.
                 }
             }
 
-            NSString *rewrittenValue = ApolloCommentTextByWrappingRedditUploadedMediaURLs(value);
-            if (![rewrittenValue isEqualToString:value]) {
-                ApolloLog(@"[RedditUpload] Rewriting %@ text to markdown-link fallback", request.URL.path);
-                value = rewrittenValue;
-                changed = YES;
+            if (richTextJSONString.length == 0) {
+                NSString *rewrittenValue = ApolloCommentTextByWrappingRedditUploadedMediaURLs(value);
+                if (![rewrittenValue isEqualToString:value]) {
+                    ApolloLog(@"[RedditUpload] Rewriting %@ text to markdown-link fallback", request.URL.path);
+                    value = rewrittenValue;
+                    changed = YES;
+                }
             }
         }
 
         if ([key isEqualToString:@"return_rtjson"]) { value = @"true"; wroteReturnRichTextJSON = YES; }
 
+        // Phase C: If the original body already contained a `richtext_json` pair
+        // (Apollo sometimes emits a placeholder), replace its value with the
+        // freshly-generated one rather than appending a second copy. Duplicate
+        // keys produce ambiguous server-side behavior.
+        if ([key isEqualToString:@"richtext_json"] && richTextJSONString.length > 0) {
+            ApolloLog(@"[RedditUpload] Replaced existing richtext_json (origLen=%lu, newLen=%lu)",
+                      (unsigned long)value.length, (unsigned long)richTextJSONString.length);
+            value = richTextJSONString;
+            replacedExistingRichTextJSON = YES;
+            changed = YES;
+        }
+
         [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(key), ApolloFormEncodeComponent(value)]];
     }
 
-    if (richTextJSONString.length > 0) {
+    if (richTextJSONString.length > 0 && !replacedExistingRichTextJSON) {
         [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"richtext_json"), ApolloFormEncodeComponent(richTextJSONString)]];
-        if (!wroteReturnRichTextJSON) {
-            [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"return_rtjson"), ApolloFormEncodeComponent(@"true")]];
-        }
+    }
+    if (richTextJSONString.length > 0 && !wroteReturnRichTextJSON) {
+        [rewrittenPairs addObject:[NSString stringWithFormat:@"%@=%@", ApolloFormEncodeComponent(@"return_rtjson"), ApolloFormEncodeComponent(@"true")]];
     }
 
     if (!changed) return nil;
@@ -1470,6 +1756,7 @@ NSURLRequest *ApolloRedditMaybeRewriteCommentRequest(NSURLRequest *request) {
     NSData *newBody = [[rewrittenPairs componentsJoinedByString:@"&"] dataUsingEncoding:NSUTF8StringEncoding];
     [modifiedRequest setHTTPBody:newBody];
     [modifiedRequest setValue:[NSString stringWithFormat:@"%lu", (unsigned long)newBody.length] forHTTPHeaderField:@"Content-Length"];
+
     return modifiedRequest;
 }
 
@@ -2186,6 +2473,26 @@ static NSData *ApolloRedditWrapCommentForApollo(NSMutableDictionary *comment) {
 }
 
 static void ApolloRedditPopulateAndDeliverComment(NSMutableDictionary *comment, ApolloRedditResponseDataCompletion completion) {
+    // Native-Giphy comments (`media_metadata` key `giphy|<id>`, body
+    // `![gif](giphy|<id>)`) need NO body merging: Reddit's response already
+    // contains valid metadata and Apollo's renderer handles the native token
+    // inline. Falling through to the generic media-URL merge would call
+    // ApolloRedditUploadFallbackURLForAssetID("giphy|<id>") and build a bogus
+    // `https://i.redd.it/giphy|<id>.jpeg` URL, which then gets prepended to
+    // comment[@"body"] by ApolloPopulateRedditCommentDisplayBody. That URL is
+    // unresolvable and surfaces in Apollo as the "If you are looking for an
+    // image, it was probably deleted." placeholder above the GIF, and (worse)
+    // shows up in the Edit Comment composer because the mutated body becomes
+    // the in-memory truth until a pull-to-refresh swaps it for Reddit's clean
+    // canonical body.
+    NSString *earlyAssetID = ApolloMediaAssetIDFromComment(comment);
+    if ([earlyAssetID hasPrefix:@"giphy|"]) {
+        ApolloLog(@"[RedditUpload] Native giphy comment: skipping body merge (assetID=%@)", earlyAssetID);
+        NSData *wrappedGiphy = ApolloRedditWrapCommentForApollo(comment);
+        completion(wrappedGiphy.length > 0 ? wrappedGiphy : nil);
+        return;
+    }
+
     NSString *assetID = nil, *mediaStatus = nil;
     NSString *mediaURL = ApolloBestDisplayURLForRedditComment(comment, YES, &assetID, &mediaStatus);
     if (mediaURL.length > 0) {
@@ -2199,6 +2506,15 @@ static void ApolloRedditPopulateAndDeliverComment(NSMutableDictionary *comment, 
 // Async-poll /api/info up to N times, then deliver the hydrated comment (or the
 // original with a fallback URL). Never blocks the caller. Worst case ~6.2s.
 static void ApolloRedditHydrateAndDeliverComment(NSMutableDictionary *comment, NSUInteger attemptIndex, ApolloRedditResponseDataCompletion completion) {
+    // Native-Giphy comments come back from /api/comment with valid
+    // media_metadata immediately — skip the hydration poll and deliver now so
+    // ApolloRedditPopulateAndDeliverComment can short-circuit the body merge.
+    NSString *giphyAssetID = ApolloMediaAssetIDFromComment(comment);
+    if ([giphyAssetID hasPrefix:@"giphy|"]) {
+        ApolloRedditPopulateAndDeliverComment(comment, completion);
+        return;
+    }
+
     NSString *fullName = [comment[@"name"] isKindOfClass:[NSString class]] ? comment[@"name"] : nil;
     NSString *currentMediaURL = ApolloBestDisplayURLForRedditComment(comment, NO, NULL, NULL);
 
@@ -2403,6 +2719,68 @@ static void ApolloLogUnhandledImgurUploadRequestOnce(NSURLRequest *request, NSSt
     ApolloLog(@"[RedditUpload] Observed unsupported Imgur upload request source=%@ path=%@ contentType=%@", source ?: @"(unknown)", request.URL.path ?: @"(missing)", contentType);
 }
 
+// Keyless Web JSON mode + Imgur upload provider + no Imgur API key configured =
+// the Imgur upload will fail with a generic error. Surface a clear, actionable
+// message once per launch instead, telling the user how to make uploads work.
+// Shown once when an upload in a keyless Web JSON session can't use the Reddit
+// cookie path and there's no Imgur key to fall back to. Inline IMAGE uploads now
+// go to Reddit via the cookie + modhash web lease (image_upload_s3.json — see
+// ApolloShouldUseCookieRedditUpload), but videos (and the rare read-only session
+// with no modhash) still need Imgur, which requires an Imgur API key. The message
+// must NOT suggest switching the provider to Reddit — that's automatic for images.
+static void ApolloWarnKeylessUploadUnavailableOnce(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *top = nil;
+            for (UIWindow *window in [ApolloAllWindows() reverseObjectEnumerator]) {
+                if (window.hidden || window.alpha < 0.01) continue;
+                top = ApolloRedditVisibleControllerFromController(window.rootViewController);
+                if (top) break;
+            }
+            if (!top) return;
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"This Upload Needs an Imgur Key"
+                                 message:@"In Web JSON Mode, Apollo uploads images straight to Reddit — but videos go through Imgur, which needs an Imgur API key. Add one under Settings → Apollo to upload videos, or attach an image instead."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [top presentViewController:alert animated:YES completion:nil];
+        });
+    });
+}
+
+// The bearer used for the Reddit media lease. Prefer the compose's posting-account
+// token, then the last captured token. In the keyless Web JSON escape hatch there
+// is no real bearer, so return the synthetic placeholder — the chokepoint rewrite
+// (ApolloWebJSONRewriteRequest) strips it and authenticates the lease with the
+// session cookie + modhash instead. Returns nil when no upload auth is available.
+static NSString *ApolloRedditUploadBearerToken(void) {
+    NSString *composeToken = ApolloMediaComposerActivePostingBearerToken();
+    if (composeToken.length > 0) return composeToken;
+    if (sLatestRedditBearerToken.length > 0) return [sLatestRedditBearerToken copy];
+    if (ApolloWebJSONHasUsableSession()) return ApolloWebJSONSyntheticBearerToken;
+    return nil;
+}
+
+// Whether a keyless Web JSON image upload should go to Reddit via the cookie +
+// modhash web lease (image_upload_s3.json — Hydra's path) instead of falling back
+// to Imgur. True only when: it's an Imgur-host upload request, there's no real
+// bearer (just the synthetic placeholder), a usable cookie session WITH a modhash
+// exists (writes need the modhash), and it's an image. The web lease is image-only,
+// so we bail on a video Content-Type; and a native-video post enters this hook with
+// a poster-image body (the video file is swapped in downstream), so we also bail
+// when a video upload context is/was in flight. Videos keep falling back to Imgur.
+static BOOL ApolloShouldUseCookieRedditUpload(NSURLRequest *request) {
+    if (!ApolloIsImgurImageUploadRequest(request)) return NO;
+    if (![ApolloRedditUploadBearerToken() isEqualToString:ApolloWebJSONSyntheticBearerToken]) return NO;
+    if (!ApolloWebJSONHasUsableSession()) return NO;
+    if (sWebSessionModhash.length == 0) return NO;
+    NSString *mimeType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
+    if (ApolloMediaMIMETypeIsVideo(mimeType)) return NO;
+    if (ApolloMediaComposerRecentlyHadSelectedVideoContextForUpload()) return NO;
+    return YES;
+}
+
 static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *mediaFileURL, NSString *filename, NSString *mimeType,
                                                   NSData *videoPosterData, NSDictionary *videoContext, NSURL *originalURL, ApolloRedditNativeUploadAttempt *attempt,
                                                   void (^completionHandler)(NSData *, NSURLResponse *, NSError *)) {
@@ -2414,9 +2792,14 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     // different account, which makes Reddit reject the submit with
     // "All media assets must be owned by the submitter of this post".
     NSString *composeToken = ApolloMediaComposerActivePostingBearerToken();
-    NSString *token = composeToken.length > 0 ? composeToken : [sLatestRedditBearerToken copy];
+    NSString *token = ApolloRedditUploadBearerToken();
+    // Keyless Web JSON: no real bearer (just the synthetic placeholder), so the
+    // lease goes to the old-reddit web endpoint with cookie + modhash instead.
+    BOOL cookieMode = [token isEqualToString:ApolloWebJSONSyntheticBearerToken];
     if (composeToken.length > 0 && ![composeToken isEqualToString:sLatestRedditBearerToken]) {
         ApolloLog(@"[RedditUpload] Using temporary posting account token for upload (differs from last captured Reddit token)");
+    } else if ([token isEqualToString:ApolloWebJSONSyntheticBearerToken]) {
+        ApolloLog(@"[RedditUpload] No real bearer token; routing media lease through the Web JSON cookie session");
     }
     NSString *userAgent = sUserAgent.length > 0 ? sUserAgent : defaultUserAgent;
     if (ApolloRedditNativeUploadAttemptIsCancelled(attempt, @"before-media-upload")) return;
@@ -2428,7 +2811,9 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     ApolloUpdateActiveUploadAlertProgress(0.0);
     ApolloRedditMediaUploadCompletion mediaCompletion = ^(NSURL *mediaURL, NSString *assetID, NSString *webSocketURL, NSError *error) {
         if (ApolloRedditNativeUploadAttemptIsCancelled(attempt, @"media-upload-completion")) return;
-        if (error || !mediaURL || assetID.length == 0) {
+        // Cookie uploads (image_upload_s3.json) never return an asset_id — the S3
+        // <Location> URL is the whole payload — so only require it off the cookie path.
+        if (error || !mediaURL || (!cookieMode && assetID.length == 0)) {
             ApolloLog(@"[RedditUpload] Upload failed: %@", error.localizedDescription);
             if (videoContext) ApolloMediaComposerCompleteVideoUploadContext(videoContext, YES, @"media-upload-error");
             completionHandler(nil, nil, error ?: [NSError errorWithDomain:@"ApolloRedditMediaUpload" code:50
@@ -2446,6 +2831,10 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
             NSDictionary *info = ApolloRedditUploadInfoForAssetID(assetID);
             NSString *posterURL = [info[@"posterURL"] isKindOfClass:[NSString class]] ? info[@"posterURL"] : nil;
             ApolloLog(@"[RedditUpload] Completed Reddit native %@ upload (assetID=%@, websocket=%@, poster=%@)", isVideo ? @"video" : @"image", assetID, webSocketURL.length > 0 ? @"yes" : @"no", isVideo ? (posterURL.length > 0 ? @"yes" : @"no") : @"n/a");
+            // Manage Uploads (issue #414): remember the upload so a delete of
+            // this entry can be acknowledged (Reddit has no delete API) and
+            // its list thumbnail can resolve to the real media URL.
+            ApolloUploadRegistryRecordRedditUpload(mediaURL);
             NSData *jsonData = ApolloSyntheticImgurUploadResponseData(mediaURL, resolvedMIMEType);
             NSHTTPURLResponse *response = ApolloSyntheticImgurHTTPResponse(originalURL ?: mediaURL);
             completionHandler(jsonData, response, nil);
@@ -2500,9 +2889,13 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
         completeSyntheticUpload();
     };
     if (mediaFileURL) {
-        attempt.mediaOperation = ApolloUploadMediaFileToRedditCancellable(mediaFileURL, filename, mimeType, token, userAgent, progressHandler, mediaCompletion);
+        attempt.mediaOperation = cookieMode
+            ? ApolloUploadMediaFileToRedditViaCookieCancellable(mediaFileURL, filename, mimeType, sWebSessionCookieHeader, sWebSessionModhash, userAgent, progressHandler, mediaCompletion)
+            : ApolloUploadMediaFileToRedditCancellable(mediaFileURL, filename, mimeType, token, userAgent, progressHandler, mediaCompletion);
     } else {
-        attempt.mediaOperation = ApolloUploadMediaDataToRedditCancellable(mediaData, filename, mimeType, token, userAgent, progressHandler, mediaCompletion);
+        attempt.mediaOperation = cookieMode
+            ? ApolloUploadMediaDataToRedditViaCookieCancellable(mediaData, filename, mimeType, sWebSessionCookieHeader, sWebSessionModhash, userAgent, progressHandler, mediaCompletion)
+            : ApolloUploadMediaDataToRedditCancellable(mediaData, filename, mimeType, token, userAgent, progressHandler, mediaCompletion);
     }
 }
 
@@ -2531,14 +2924,70 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromData:(NSData *)bodyData completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession uploadTaskWithRequest:fromData:");
 
-    if (sImageUploadProvider != ImageUploadProviderReddit || !completionHandler || !ApolloIsImgurImageUploadRequest(request)) {
+    // ImgChest host: divert Apollo's Imgur image upload to the ImgChest API
+    // and answer with a synthetic Imgur response carrying the ImgChest link.
+    // ImgChest uses its own API key (not Reddit's bearer), so this runs ahead of
+    // the keyless Web JSON fallback below and always returns when it applies.
+    if ((sImageUploadProvider == ImageUploadProviderImgChest || ApolloChatImageUploadPending()) && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
+        BOOL chestForChat = ApolloChatImageUploadPending();   // capture now; the upload completes asynchronously
+        if (chestForChat) ApolloChatClearImageUpload();        // window consumed: don't let it leak to a later non-chat upload
+        NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(nil, [request valueForHTTPHeaderField:@"Content-Type"]);
+        if (!ApolloImgChestUploadAvailable() || ApolloMediaMIMETypeIsVideo(chestMIMEType)) {
+            ApolloLog(@"[ImgChestUpload] %@ — falling back to Imgur (fromData)",
+                      !ApolloImgChestUploadAvailable() ? @"no ImgChest API key" : @"video uploads not supported by ImgChest");
+            return %orig;
+        }
+        NSString *chestExtension = ApolloRedditUploadExtensionForMIMEType(chestMIMEType);
+        NSString *chestFilename = [@"apollo-upload" stringByAppendingPathExtension:chestExtension];
+        NSData *chestData = bodyData ?: [NSData data];
+        NSURL *requestURL = request.URL;
+        ApolloLog(@"[ImgChestUpload] Intercepting Imgur data upload (%lu bytes)", (unsigned long)chestData.length);
+        void (^chestWrapped)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+            ApolloImgChestUploadData(chestData, chestFilename, chestMIMEType, ^(NSURL *link, NSError *uploadError) {
+                if (!link) {
+                    completionHandler(nil, nil, uploadError);
+                    return;
+                }
+                // For a chat send, swap the long CDN file URL for the short imgchest.com/p/<id> post URL
+                // (the chat renderer resolves it back to the image inline via ApolloImageChestResolver).
+                NSURL *sendLink = (chestForChat ? (ApolloImgChestPostURLForUploadedLink(link) ?: link) : link);
+                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(sendLink, chestMIMEType);
+                NSHTTPURLResponse *fake = [[NSHTTPURLResponse alloc] initWithURL:requestURL
+                                                                      statusCode:200
+                                                                     HTTPVersion:@"HTTP/1.1"
+                                                                    headerFields:@{@"Content-Type": @"application/json"}];
+                completionHandler(synthetic, fake, nil);
+            });
+        };
+        return %orig(ApolloRedditUploadFastFailRequest(), bodyData ?: [NSData data], chestWrapped);
+    }
+
+    // Keyless Web JSON session (no real OAuth bearer, just the synthetic
+    // placeholder). Inline IMAGE uploads now go to Reddit via the cookie + modhash
+    // web lease (image_upload_s3.json — see ApolloShouldUseCookieRedditUpload); the
+    // native-upload path below drives it when cookieMode is set, overriding the
+    // (default-Imgur) provider since a cookie-signed-in user's images belong on
+    // Reddit. ImgChest with its own key already returned above. For anything the
+    // web lease can't take — a video, or a read-only session with no modhash — fall
+    // back to Apollo's Imgur path and warn once if no Imgur key is set either.
+    BOOL cookieUpload = ApolloShouldUseCookieRedditUpload(request);
+    if (ApolloIsImgurImageUploadRequest(request)
+        && [ApolloRedditUploadBearerToken() isEqualToString:ApolloWebJSONSyntheticBearerToken]
+        && !cookieUpload) {
+        if (sImgurClientId.length == 0) ApolloWarnKeylessUploadUnavailableOnce();
+        return %orig;
+    }
+    if ((sImageUploadProvider != ImageUploadProviderReddit && !cookieUpload) || !completionHandler || !ApolloIsImgurImageUploadRequest(request)) {
         if (sImageUploadProvider == ImageUploadProviderReddit && completionHandler) ApolloLogUnhandledImgurUploadRequestOnce(request, @"fromData");
         return %orig;
     }
     // The compose's temporaryPostingAccount can supply a token even if no
     // global token has been captured yet (e.g. multi-account user opens the
     // composer and chooses an account before any other Reddit API call runs).
-    if (sLatestRedditBearerToken.length == 0 && ApolloMediaComposerActivePostingBearerToken().length == 0) {
+    // In keyless Web JSON mode there's no real bearer but the cookie session can
+    // carry the lease, so ApolloRedditUploadBearerToken() returns the synthetic
+    // placeholder and we proceed instead of falling back to a (keyless) Imgur upload.
+    if (ApolloRedditUploadBearerToken().length == 0) {
         ApolloLog(@"[RedditUpload] No captured Reddit bearer token yet; using Imgur upload");
         return %orig;
     }
@@ -2607,11 +3056,60 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
 - (NSURLSessionUploadTask *)uploadTaskWithRequest:(NSURLRequest *)request fromFile:(NSURL *)fileURL completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
     ApolloRedditCaptureBearerTokenFromRequest(request, @"NSURLSession uploadTaskWithRequest:fromFile:");
 
-    if (sImageUploadProvider != ImageUploadProviderReddit || !completionHandler || !ApolloIsImgurImageUploadRequest(request)) {
+    // ImgChest host (see the fromData: hook) — runs ahead of the keyless Web JSON
+    // fallback since it authenticates with its own API key, and always returns when
+    // ImgChest is the selected provider for an Imgur upload request.
+    if ((sImageUploadProvider == ImageUploadProviderImgChest || ApolloChatImageUploadPending()) && completionHandler && ApolloIsImgurImageUploadRequest(request)) {
+        BOOL chestForChat = ApolloChatImageUploadPending();   // capture now; the upload completes asynchronously
+        if (chestForChat) ApolloChatClearImageUpload();        // window consumed: don't let it leak to a later non-chat upload
+        NSString *chestFilename = fileURL.lastPathComponent.length > 0 ? fileURL.lastPathComponent : @"apollo-upload.jpg";
+        NSString *chestMIMEType = ApolloMediaMIMETypeForFilename(chestFilename, [request valueForHTTPHeaderField:@"Content-Type"]);
+        NSData *chestData = [NSData dataWithContentsOfURL:fileURL];
+        if (!ApolloImgChestUploadAvailable() || ApolloMediaMIMETypeIsVideo(chestMIMEType) || chestData.length == 0) {
+            ApolloLog(@"[ImgChestUpload] %@ — falling back to Imgur (fromFile)",
+                      !ApolloImgChestUploadAvailable() ? @"no ImgChest API key"
+                          : (chestData.length == 0 ? @"could not read file" : @"video uploads not supported by ImgChest"));
+            return %orig;
+        }
+        NSURL *requestURL = request.URL;
+        ApolloLog(@"[ImgChestUpload] Intercepting Imgur file upload (%lu bytes, %@)", (unsigned long)chestData.length, chestFilename);
+        void (^chestWrapped)(NSData *, NSURLResponse *, NSError *) = ^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {
+            ApolloImgChestUploadData(chestData, chestFilename, chestMIMEType, ^(NSURL *link, NSError *uploadError) {
+                if (!link) {
+                    completionHandler(nil, nil, uploadError);
+                    return;
+                }
+                // For a chat send, swap the long CDN file URL for the short imgchest.com/p/<id> post URL
+                // (the chat renderer resolves it back to the image inline via ApolloImageChestResolver).
+                NSURL *sendLink = (chestForChat ? (ApolloImgChestPostURLForUploadedLink(link) ?: link) : link);
+                NSData *synthetic = ApolloSyntheticImgurUploadResponseData(sendLink, chestMIMEType);
+                NSHTTPURLResponse *fake = [[NSHTTPURLResponse alloc] initWithURL:requestURL
+                                                                      statusCode:200
+                                                                     HTTPVersion:@"HTTP/1.1"
+                                                                    headerFields:@{@"Content-Type": @"application/json"}];
+                completionHandler(synthetic, fake, nil);
+            });
+        };
+        return %orig(ApolloRedditUploadFastFailRequest(), fileURL, chestWrapped);
+    }
+
+    // See the fromData: hook. Keyless Web JSON image uploads go to Reddit via the
+    // cookie + modhash web lease (image_upload_s3.json); the native-upload path
+    // below drives it when cookieMode is set. Videos / read-only sessions (no
+    // modhash) can't take that path, so they fall back to Imgur (warn once if no
+    // Imgur key). ImgChest with its own key already returned above.
+    BOOL cookieUpload = ApolloShouldUseCookieRedditUpload(request);
+    if (ApolloIsImgurImageUploadRequest(request)
+        && [ApolloRedditUploadBearerToken() isEqualToString:ApolloWebJSONSyntheticBearerToken]
+        && !cookieUpload) {
+        if (sImgurClientId.length == 0) ApolloWarnKeylessUploadUnavailableOnce();
+        return %orig;
+    }
+    if ((sImageUploadProvider != ImageUploadProviderReddit && !cookieUpload) || !completionHandler || !ApolloIsImgurImageUploadRequest(request)) {
         if (sImageUploadProvider == ImageUploadProviderReddit && completionHandler) ApolloLogUnhandledImgurUploadRequestOnce(request, @"fromFile");
         return %orig;
     }
-    if (sLatestRedditBearerToken.length == 0 && ApolloMediaComposerActivePostingBearerToken().length == 0) {
+    if (ApolloRedditUploadBearerToken().length == 0) {
         ApolloLog(@"[RedditUpload] No captured Reddit bearer token yet; using Imgur upload");
         return %orig;
     }
@@ -2687,6 +3185,253 @@ static void ApolloCompleteRedditNativeMediaUpload(NSData *mediaData, NSURL *medi
     ApolloRedditNativeUploadAttempt *attempt = objc_getAssociatedObject(self, &kApolloRedditNativeUploadAttemptKey);
     if (attempt) [attempt cancelWithReason:@"NSURLSessionTask cancel"];
     %orig;
+}
+
+%end
+
+// MARK: - Manage Uploads screen (footer wording + thumbnails)
+//
+// Thumbnails: Apollo's uploads cell derives its thumbnail from an
+// Imgur-shaped URL, so Reddit/ImgChest uploads silently get none — no
+// request is ever issued (confirmed by logging every NSURLSession and
+// NSData entry point while the screen loads). Apollo persists the uploads
+// (with their real URLs) in Documents/imgur-uploads.plist in display order;
+// load the row's media ourselves and set it on the cell's thumbnail slot.
+// Imgur rows are left entirely native.
+
+static NSCache<NSString *, UIImage *> *ApolloUploadsThumbCache(void) {
+    static NSCache *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [[NSCache alloc] init]; });
+    return cache;
+}
+
+static NSArray<NSDictionary *> *ApolloUploadsListFromDisk(void) {
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/imgur-uploads.plist"];
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (data.length == 0) return nil;
+    id plist = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:NULL];
+    return [plist isKindOfClass:[NSArray class]] ? plist : nil;
+}
+
+static NSDictionary *ApolloUploadsEntryForRow(NSInteger row, NSInteger totalRows) {
+    NSArray<NSDictionary *> *uploads = ApolloUploadsListFromDisk();
+    // Guard against an order mismatch: only trust the mapping when the table
+    // row count matches the persisted list.
+    if ((NSInteger)uploads.count != totalRows || row < 0 || row >= (NSInteger)uploads.count) return nil;
+    NSDictionary *entry = uploads[(NSUInteger)row];
+    return [entry isKindOfClass:[NSDictionary class]] ? entry : nil;
+}
+
+static NSURL *ApolloUploadsMediaURLFromEntry(NSDictionary *entry) {
+    id urlValue = entry[@"url"];
+    NSString *urlString = [urlValue isKindOfClass:[NSDictionary class]] ? urlValue[@"relative"]
+                        : ([urlValue isKindOfClass:[NSString class]] ? urlValue : nil);
+    return [urlString isKindOfClass:[NSString class]] && [urlString length] > 0 ? [NSURL URLWithString:urlString] : nil;
+}
+
+static NSString *ApolloUploadsProviderNameForURL(NSURL *url) {
+    NSString *host = url.host.lowercaseString ?: @"";
+    if ([host containsString:@"imgchest"]) return @"Img Chest";
+    if ([host containsString:@"redd.it"] || [host containsString:@"reddit"]) return @"Reddit";
+    if ([host containsString:@"imgur"]) return @"Imgur";
+    return host.length > 0 ? host : nil;
+}
+
+// The thumbnail slot: the leftmost UIImageView of meaningful size in the
+// cell, excluding control imagery (the trash button's icon). Only valid
+// once the cell has been laid out — at cellForRow time every frame is zero.
+static UIImageView *ApolloUploadsThumbImageViewInCell(UITableViewCell *cell) {
+    UIImageView *best = nil;
+    CGFloat bestX = CGFLOAT_MAX;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:cell.contentView ?: cell];
+    while (stack.count > 0) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if ([view isKindOfClass:[UIControl class]]) continue; // skip the trash button subtree
+        if ([view isKindOfClass:[UIImageView class]] && view.bounds.size.width >= 30.0) {
+            CGFloat x = [view convertRect:view.bounds toView:cell].origin.x;
+            if (x < bestX) { best = (UIImageView *)view; bestX = x; }
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return best;
+}
+
+// Apply `image` to the row's thumbnail slot once layout has produced real
+// frames; key checks guard against cell reuse races.
+static char kApolloUploadsCellURLKey;
+
+static void ApolloUploadsApplyThumb(UITableViewCell *cell, NSString *key, UIImage *image) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *currentKey = objc_getAssociatedObject(cell, &kApolloUploadsCellURLKey);
+        if (![currentKey isEqualToString:key]) return;
+        UIImageView *thumbView = ApolloUploadsThumbImageViewInCell(cell);
+        if (!thumbView) {
+            ApolloLog(@"[ImgChestUpload] uploads thumbnail: no image view found in laid-out cell (key=%@)", key);
+            return;
+        }
+        thumbView.contentMode = UIViewContentModeScaleAspectFill;
+        thumbView.clipsToBounds = YES;
+        thumbView.image = image;
+        ApolloLog(@"[ImgChestUpload] uploads thumbnail set (view=%@ frame=%@)",
+                  NSStringFromClass([thumbView class]), NSStringFromCGRect(thumbView.frame));
+    });
+}
+
+// Augment the row's "2h Ago" label with the upload host and the exact upload
+// date — with three possible hosts, "where did this go?" matters.
+//
+// Apollo's cell re-runs its own manual layout after any frame we set on its
+// label (it pins the label's top back to y=16), so a two-line frame never
+// sticks and the date line draws past the row bottom. Instead, hide Apollo's
+// label and render the text in our own overlay label spanning the full row
+// height — UILabel vertically centers its text, and Apollo's layout never
+// touches a view it doesn't know about.
+static char kApolloUploadsDetailLabelKey;
+// The native label we hid for a given cell, so a bail-out path can un-hide it.
+static char kApolloUploadsHiddenLabelKey;
+
+// Undo the overlay/hidden-label state we applied to a (possibly recycled) cell.
+// Without this, a cell that previously showed our overlay can be reused on a
+// bail-out path (e.g. right after a delete, when numberOfRowsInSection and the
+// on-disk uploads list momentarily disagree so ApolloUploadsEntryForRow returns
+// nil) and briefly draw a stale overlay over a still-hidden native label.
+static void ApolloUploadsResetDetail(UITableViewCell *cell) {
+    UILabel *hiddenLabel = objc_getAssociatedObject(cell, &kApolloUploadsHiddenLabelKey);
+    if ([hiddenLabel isKindOfClass:[UILabel class]]) hiddenLabel.hidden = NO;
+    objc_setAssociatedObject(cell, &kApolloUploadsHiddenLabelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UILabel *overlay = objc_getAssociatedObject(cell, &kApolloUploadsDetailLabelKey);
+    if ([overlay isKindOfClass:[UILabel class]]) {
+        overlay.text = nil;
+        overlay.hidden = YES;
+    }
+    // Drop the key so any still-queued apply block for the old key fails its
+    // currentKey guard instead of re-applying the overlay after this reset.
+    objc_setAssociatedObject(cell, &kApolloUploadsCellURLKey, nil, OBJC_ASSOCIATION_COPY_NONATOMIC);
+}
+
+static void ApolloUploadsApplyDetail(UITableViewCell *cell, NSString *key, NSString *provider, NSDate *date) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *currentKey = objc_getAssociatedObject(cell, &kApolloUploadsCellURLKey);
+        if (![currentKey isEqualToString:key]) return;
+
+        UILabel *overlay = objc_getAssociatedObject(cell, &kApolloUploadsDetailLabelKey);
+        UILabel *label = nil;
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:cell.contentView ?: cell];
+        while (stack.count > 0) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            if (view == overlay || [view isKindOfClass:[UIControl class]]) continue;
+            if ([view isKindOfClass:[UILabel class]] && [(UILabel *)view text].length > 0) { label = (UILabel *)view; break; }
+            [stack addObjectsFromArray:view.subviews];
+        }
+        if (!label) return;
+
+        static NSDateFormatter *formatter;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            formatter = [[NSDateFormatter alloc] init];
+            formatter.dateStyle = NSDateFormatterMediumStyle;
+            formatter.timeStyle = NSDateFormatterShortStyle;
+        });
+
+        NSMutableString *text = [NSMutableString stringWithString:label.text];
+        if (provider.length > 0) [text appendFormat:@" · %@", provider];
+        if (date) [text appendFormat:@"\n%@", [formatter stringFromDate:date]];
+
+        UIView *container = label.superview ?: cell.contentView;
+        if (!overlay) {
+            overlay = [[UILabel alloc] init];
+            overlay.numberOfLines = 2;
+            objc_setAssociatedObject(cell, &kApolloUploadsDetailLabelKey, overlay, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (overlay.superview != container) {
+            [overlay removeFromSuperview];
+            [container addSubview:overlay];
+        }
+        overlay.font = label.font;
+        overlay.textColor = label.textColor;
+        overlay.text = text;
+        overlay.hidden = NO; // undo a prior ApolloUploadsResetDetail on a reused cell
+        CGFloat x = label.frame.origin.x;
+        overlay.frame = CGRectMake(x, 0, container.bounds.size.width - x - 56.0, container.bounds.size.height); // keep clear of the trash button
+        overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        label.hidden = YES;
+        // Remember which native label we hid so a bail-out path can restore it.
+        objc_setAssociatedObject(cell, &kApolloUploadsHiddenLabelKey, label, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    });
+}
+
+%hook _TtC6Apollo40SettingsDeleteImgurUploadsViewController
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = %orig;
+    @try {
+        NSInteger totalRows = [tableView numberOfRowsInSection:indexPath.section];
+        NSDictionary *entry = ApolloUploadsEntryForRow(indexPath.row, totalRows);
+        NSURL *mediaURL = entry ? ApolloUploadsMediaURLFromEntry(entry) : nil;
+        if (!mediaURL) {
+            // Reset any overlay/hidden-label state from this cell's previous use
+            // so a recycled cell doesn't show a stale overlay over a hidden label.
+            ApolloUploadsResetDetail(cell);
+            return cell;
+        }
+
+        NSString *key = mediaURL.absoluteString;
+        objc_setAssociatedObject(cell, &kApolloUploadsCellURLKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+
+        // Provider + exact date detail, for every host including Imgur.
+        NSDate *uploadedAt = [entry[@"dateUploaded"] isKindOfClass:[NSDate class]] ? entry[@"dateUploaded"] : nil;
+        ApolloUploadsApplyDetail(cell, key, ApolloUploadsProviderNameForURL(mediaURL), uploadedAt);
+
+        // Imgur uploads keep Apollo's native thumbnail pipeline.
+        if ([mediaURL.host.lowercaseString containsString:@"imgur"]) return cell;
+
+        UIImage *cached = [ApolloUploadsThumbCache() objectForKey:key];
+        if (cached) {
+            ApolloUploadsApplyThumb(cell, key, cached);
+            return cell;
+        }
+
+        NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:mediaURL
+                                                               cachePolicy:NSURLRequestReturnCacheDataElseLoad
+                                                           timeoutInterval:30.0];
+        // imgchest's CDN rejects UA-less requests with 403.
+        [request setValue:@"Apollo/1.15.11 (iOS)" forHTTPHeaderField:@"User-Agent"];
+        __weak UITableViewCell *weakCell = cell;
+        [[[NSURLSession sharedSession] dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            UIImage *full = data.length > 0 ? [UIImage imageWithData:data] : nil;
+            if (!full) {
+                NSHTTPURLResponse *http = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+                ApolloLog(@"[ImgChestUpload] uploads thumbnail load failed status=%ld err=%@ url=%@",
+                          (long)http.statusCode, error.localizedDescription ?: @"nil", key);
+                return;
+            }
+            // Downscale to thumbnail size off-main; full uploads can be huge.
+            CGFloat maxDimension = 160.0;
+            CGFloat scale = MIN(1.0, maxDimension / MAX(full.size.width, full.size.height));
+            CGSize thumbSize = CGSizeMake(MAX(full.size.width * scale, 1.0), MAX(full.size.height * scale, 1.0));
+            UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:thumbSize];
+            UIImage *thumb = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+                [full drawInRect:CGRectMake(0, 0, thumbSize.width, thumbSize.height)];
+            }];
+            [ApolloUploadsThumbCache() setObject:thumb forKey:key];
+            UITableViewCell *strongCell = weakCell;
+            if (strongCell) ApolloUploadsApplyThumb(strongCell, key, thumb);
+        }] resume];
+    } @catch (__unused NSException *e) {}
+    return cell;
+}
+
+// The native footer only mentions Imgur, but with the upload-host options the
+// list can also contain Reddit and Img Chest uploads.
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    NSString *original = %orig;
+    if (original.length == 0) return original;
+    return @"Media you've uploaded from Apollo — to Imgur, Reddit, or Img Chest depending on your Media Upload Host. "
+           @"Deleting removes Imgur and Img Chest uploads from their host; Reddit uploads are only removed from this list.";
 }
 
 %end

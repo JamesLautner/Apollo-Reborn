@@ -19,6 +19,9 @@ static char kApolloSubredditOriginalSelectedBackgroundKey;
 static char kApolloSubredditOriginalMultipleSelectedBackgroundKey;
 static char kApolloSubredditModernSelectionChromeAppliedKey;
 static char kApolloSubredditModernPressOverlayKey;
+// Flag-independent "this is the subreddit list" marker used only by the tap/selection highlight fix
+// (#452). Distinct from kApolloSubredditIndexTableKey, which gates the enhancement styling suite.
+static char kApolloSubredditSelectionTableKey;
 static char kApolloSubredditHeaderSeparatorKey;
 static char kApolloSubredditHeaderGradientLayerKey;
 static char kApolloSubredditHeaderLoggedKey;
@@ -501,18 +504,6 @@ static void ApolloSubredditIndexClearHeaderChrome(UIView *header, UILabel *label
     header.opaque = NO;
 }
 
-static void ApolloSubredditIndexApplyModernTableSurfaceBackground(UITableView *tableView) {
-    if (!sModernSubredditDividers || !tableView) return;
-
-    // Transparent section headers reveal UITableView gaps; match the row surface instead.
-    UIColor *surfaceColor = ApolloSubredditIndexThemeListBackgroundColor(tableView, tableView);
-    tableView.backgroundColor = surfaceColor;
-    if (tableView.backgroundView) {
-        tableView.backgroundView.backgroundColor = surfaceColor;
-        tableView.backgroundView.opaque = ApolloSubredditIndexColorIsVisible(surfaceColor);
-    }
-}
-
 static UITableView *ApolloSubredditIndexTableForView(UIView *view) {
     while (view) {
         if ([view isKindOfClass:[UITableView class]]) return (UITableView *)view;
@@ -617,9 +608,9 @@ static void ApolloSubredditIndexClearStarChrome(UIControl *control) {
     if ([control isKindOfClass:[UIButton class]]) {
         UIButton *button = (UIButton *)control;
         button.highlighted = NO;
+        // Prevent auto-dimming on a button we don't own (no clean non-deprecated API for this).
         button.adjustsImageWhenHighlighted = NO;
         button.adjustsImageWhenDisabled = NO;
-        button.showsTouchWhenHighlighted = NO;
 
         UIControlState states[] = {
             UIControlStateNormal,
@@ -1062,6 +1053,7 @@ static void ApolloSubredditIndexRefreshFavorites(UITableView *tableView, NSStrin
 }
 
 static void ApolloSubredditIndexScheduleFavoritesRefresh(UITableView *tableView, UITableViewCell *cell, NSString *subredditName, UIControl *nativeControl) {
+    if (!sSubredditListEnhancements) return;
     __weak UITableView *weakTable = tableView;
     __weak UIControl *weakControl = nativeControl;
     NSString *name = [subredditName copy];
@@ -1122,6 +1114,7 @@ static void ApolloSubredditIndexInstallStarProxyForCell(UITableViewCell *cell, U
 }
 
 static void ApolloSubredditIndexInstallOrUpdate(UITableView *tableView) {
+    if (!sSubredditListEnhancements) return;
     if (!ApolloSubredditIndexShouldInspectTable(tableView)) return;
 
     NSArray<NSString *> *titles = ApolloSubredditIndexTitlesForTable(tableView);
@@ -1129,7 +1122,11 @@ static void ApolloSubredditIndexInstallOrUpdate(UITableView *tableView) {
 
     objc_setAssociatedObject(tableView, &kApolloSubredditIndexTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ApolloSubredditIndexApplySeparatorInsets(tableView);
-    ApolloSubredditIndexApplyModernTableSurfaceBackground(tableView);
+    // NB: deliberately do NOT colour the table's scroll-view background here. On iOS 26 any opaque
+    // UIScrollView background flips the nav bar to its glass / content-reflecting appearance, which
+    // mirrors the selected Home row across the whole header (#450). The gaps that transparent modern
+    // section headers would leave are instead filled by each header's own opaque backgroundColor in
+    // ApolloSubredditIndexStyleHeaderView, so the scroll view stays transparent.
     ApolloSubredditIndexHideNativeIndex(tableView);
 
     UIView *container = tableView.superview ?: tableView;
@@ -1174,6 +1171,7 @@ static void ApolloSubredditIndexInstallOrUpdate(UITableView *tableView) {
 }
 
 static void ApolloSubredditIndexRefreshTablesInView(UIView *view) {
+    if (!sSubredditListEnhancements) return;
     if (!view) return;
 
     if ([view isKindOfClass:[UITableView class]]) {
@@ -1201,12 +1199,13 @@ static void ApolloSubredditIndexRefreshTablesInView(UIView *view) {
 }
 
 static void ApolloSubredditIndexRefreshAllVisibleTables(void) {
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+    for (UIWindow *window in ApolloAllWindows()) {
         ApolloSubredditIndexRefreshTablesInView(window);
     }
 }
 
 static BOOL ApolloSubredditIndexEnsureSubredditTable(UITableView *tableView) {
+    if (!sSubredditListEnhancements) return NO;
     if (!tableView) return NO;
     if ([objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) return YES;
     if (!ApolloSubredditIndexShouldInspectTable(tableView)) return NO;
@@ -1216,6 +1215,37 @@ static BOOL ApolloSubredditIndexEnsureSubredditTable(UITableView *tableView) {
 
     objc_setAssociatedObject(tableView, &kApolloSubredditIndexTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return YES;
+}
+
+// Identifies the subreddit list purely by structure (owning title + a large A–Z section index),
+// independent of sSubredditListEnhancements / sModernSubredditDividers. This lets the tap/selection
+// highlight (#452) run in every mode — including "classic" (enhancements off) — while the rest of the
+// enhancement styling stays gated on kApolloSubredditIndexTableKey. Deliberately does NOT set that
+// enhancement key; it only caches its own kApolloSubredditSelectionTableKey.
+static BOOL ApolloSubredditIndexEnsureSelectionTable(UITableView *tableView) {
+    if (!tableView) return NO;
+    if ([objc_getAssociatedObject(tableView, &kApolloSubredditSelectionTableKey) boolValue]) return YES;
+    // If the enhancement suite already recognised this table, inherit that verdict.
+    if ([objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) {
+        objc_setAssociatedObject(tableView, &kApolloSubredditSelectionTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return YES;
+    }
+    if (!ApolloSubredditIndexShouldInspectTable(tableView)) return NO;
+    NSArray<NSString *> *titles = ApolloSubredditIndexTitlesForTable(tableView);
+    if (!ApolloSubredditIndexLooksLikeSubredditsTable(tableView, titles)) return NO;
+    objc_setAssociatedObject(tableView, &kApolloSubredditSelectionTableKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return YES;
+}
+
+// Cheap O(1) gate for the app-wide -[UITableViewCell setHighlighted:]/setSelected: hooks: only act on
+// tables we've ALREADY recognised as the subreddit list. The recognition (and the one-time structural
+// detection it needs) happens in the scoped willDisplayCell / layoutSubviews passes, which always run
+// before a row can be tapped — so by press time a subreddit table already carries one of these keys.
+// This keeps every cell tap elsewhere in the app from triggering a responder-chain walk + title compare.
+static BOOL ApolloSubredditIndexTableAlreadyRecognised(UITableView *tableView) {
+    if (!tableView) return NO;
+    return [objc_getAssociatedObject(tableView, &kApolloSubredditSelectionTableKey) boolValue] ||
+           [objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue];
 }
 
 static UIView *ApolloSubredditIndexModernSelectionBackground(UITableView *tableView, UITableViewCell *cell) {
@@ -1266,7 +1296,7 @@ static UIView *ApolloSubredditIndexModernPressOverlay(UITableView *tableView, UI
 
 static void ApolloSubredditIndexSetModernPressOverlayVisible(UITableViewCell *cell, UITableView *tableView, BOOL visible, BOOL animated) {
     if (!cell) return;
-    if (!sModernSubredditDividers || !tableView || !ApolloSubredditIndexEnsureSubredditTable(tableView)) {
+    if (!tableView || !ApolloSubredditIndexEnsureSelectionTable(tableView)) {
         ApolloSubredditIndexRemoveModernPressOverlay(cell);
         return;
     }
@@ -1307,40 +1337,43 @@ static void ApolloSubredditIndexRestoreCellSelectionChrome(UITableViewCell *cell
 }
 
 static void ApolloSubredditIndexApplyCellSelectionChrome(UITableViewCell *cell, UITableView *tableView) {
-    if (!cell || !tableView || !ApolloSubredditIndexEnsureSubredditTable(tableView)) return;
+    if (!cell || !tableView || !ApolloSubredditIndexEnsureSelectionTable(tableView)) return;
 
-    BOOL hideSeparators = sModernSubredditDividers;
-    UITableViewCellSeparatorStyle separatorStyle = hideSeparators ? UITableViewCellSeparatorStyleNone : UITableViewCellSeparatorStyleSingleLine;
-    if (tableView.separatorStyle != separatorStyle) {
-        tableView.separatorStyle = separatorStyle;
-    }
-
-    BOOL appliedModernChrome = [objc_getAssociatedObject(cell, &kApolloSubredditModernSelectionChromeAppliedKey) boolValue];
-    if (sModernSubredditDividers) {
-        if (!appliedModernChrome) {
-            objc_setAssociatedObject(cell, &kApolloSubredditOriginalSelectionStyleKey, @(cell.selectionStyle), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(cell, &kApolloSubredditOriginalSelectedBackgroundKey, cell.selectedBackgroundView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(cell, &kApolloSubredditOriginalMultipleSelectedBackgroundKey, cell.multipleSelectionBackgroundView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(cell, &kApolloSubredditModernSelectionChromeAppliedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // Separator style belongs to the enhancement/divider suite — only touch it when that suite owns
+    // this table. In classic mode we leave Apollo's native separators untouched.
+    if (ApolloSubredditIndexEnsureSubredditTable(tableView)) {
+        UITableViewCellSeparatorStyle separatorStyle = sModernSubredditDividers ? UITableViewCellSeparatorStyleNone : UITableViewCellSeparatorStyleSingleLine;
+        if (tableView.separatorStyle != separatorStyle) {
+            tableView.separatorStyle = separatorStyle;
         }
-
-        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        cell.selectedBackgroundView = ApolloSubredditIndexModernSelectionBackground(tableView, cell);
-        cell.multipleSelectionBackgroundView = ApolloSubredditIndexModernSelectionBackground(tableView, cell);
-        cell.backgroundView.layer.borderWidth = 0.0;
-        cell.selectedBackgroundView.layer.borderWidth = 0.0;
-        cell.multipleSelectionBackgroundView.layer.borderWidth = 0.0;
-        ApolloSubredditIndexSetModernPressOverlayVisible(cell, tableView, cell.highlighted || cell.selected, NO);
-        return;
     }
 
-    if (appliedModernChrome) ApolloSubredditIndexRestoreCellSelectionChrome(cell);
+    // Tap/selection highlight (#452). Apollo's native subreddit rows don't paint a visible selected
+    // background under Liquid Glass — their opaque cell background covers it — so we install our own
+    // selected background plus an in-contentView press overlay. This is a bug fix, so it runs in every
+    // mode, not just when Modern Subreddit Dividers is on. The enhancement toggles only govern the
+    // surrounding styling (separators, headers, custom index), handled elsewhere.
+    BOOL appliedModernChrome = [objc_getAssociatedObject(cell, &kApolloSubredditModernSelectionChromeAppliedKey) boolValue];
+    if (!appliedModernChrome) {
+        objc_setAssociatedObject(cell, &kApolloSubredditOriginalSelectionStyleKey, @(cell.selectionStyle), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cell, &kApolloSubredditOriginalSelectedBackgroundKey, cell.selectedBackgroundView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cell, &kApolloSubredditOriginalMultipleSelectedBackgroundKey, cell.multipleSelectionBackgroundView, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(cell, &kApolloSubredditModernSelectionChromeAppliedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+    cell.selectedBackgroundView = ApolloSubredditIndexModernSelectionBackground(tableView, cell);
+    cell.multipleSelectionBackgroundView = ApolloSubredditIndexModernSelectionBackground(tableView, cell);
+    cell.backgroundView.layer.borderWidth = 0.0;
+    cell.selectedBackgroundView.layer.borderWidth = 0.0;
+    cell.multipleSelectionBackgroundView.layer.borderWidth = 0.0;
+    ApolloSubredditIndexSetModernPressOverlayVisible(cell, tableView, cell.highlighted || cell.selected, NO);
 }
 
 static void ApolloSubredditIndexApplyModernPressedCellSelectionChrome(UITableViewCell *cell) {
-    if (!sModernSubredditDividers || !cell) return;
+    if (!cell) return;
     UITableView *tableView = ApolloSubredditIndexTableForCell(cell);
-    if (!ApolloSubredditIndexEnsureSubredditTable(tableView)) return;
+    if (!ApolloSubredditIndexEnsureSelectionTable(tableView)) return;
 
     ApolloSubredditIndexApplyCellSelectionChrome(cell, tableView);
     ApolloSubredditIndexSetModernPressOverlayVisible(cell, tableView, cell.highlighted || cell.selected, NO);
@@ -1353,6 +1386,7 @@ static NSInteger ApolloSubredditIndexMultiredditsSection(UITableView *tableView)
 }
 
 static void ApolloSubredditIndexTrackMultiredditsSection(UITableView *tableView, UIView *headerView, NSInteger section) {
+    if (!sSubredditListEnhancements) return;
     if (!tableView || !headerView) return;
 
     UILabel *label = ApolloSubredditIndexHeaderLabelInView(headerView);
@@ -1486,6 +1520,7 @@ static void ApolloSubredditIndexPrepareCellForDisplay(UITableView *tableView, UI
 }
 
 static void ApolloSubredditIndexStyleHeaderView(UIView *header, UITableView *tableView) {
+    if (!sSubredditListEnhancements) return;
     if (!header || !tableView) return;
     if (![objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) {
         if (!ApolloSubredditIndexShouldInspectTable(tableView)) return;
@@ -1558,6 +1593,13 @@ static void ApolloSubredditIndexStyleHeaderView(UIView *header, UITableView *tab
         objc_setAssociatedObject(tableView, &kApolloSubredditHeaderLoggedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         ApolloLog(@"[SubredditIndex] styled-header class=%@ title=%@", NSStringFromClass([header class]), text);
     }
+
+    // Fill the gap a transparent modern header would otherwise leave by giving the header its
+    // own opaque surface colour (matching the rows). This replaces the old approach of colouring
+    // the whole scroll view, which tripped the iOS 26 nav-bar glass reflection (#450). The header
+    // is a subview below the first row, so it never reaches the nav bar's reflected band.
+    UIColor *surfaceColor = ApolloSubredditIndexThemeListBackgroundColor(tableView, header);
+    header.backgroundColor = ApolloSubredditIndexColorIsVisible(surfaceColor) ? surfaceColor : tableView.backgroundColor;
 }
 
 static void ApolloSubredditIndexHeaderLayoutSubviewsHook(id self, SEL _cmd) {
@@ -1727,8 +1769,12 @@ static void ApolloSubredditIndexInstallHeaderLayoutHook(void) {
     if (!redditListCellClass || ![(UITableViewCell *)self isKindOfClass:redditListCellClass]) return;
 
     UITableView *tableView = ApolloSubredditIndexTableForCell((UITableViewCell *)self);
-    if ([objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) {
+    // Selection highlight is a bug fix that applies on the subreddit list in every mode (#452).
+    if (ApolloSubredditIndexEnsureSelectionTable(tableView)) {
         ApolloSubredditIndexApplyCellSelectionChrome((UITableViewCell *)self, tableView);
+    }
+    // Star proxy + multireddit child styling are enhancement-only.
+    if ([objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) {
         ApolloSubredditIndexInstallStarProxyForCell((UITableViewCell *)self, tableView);
         ApolloSubredditIndexApplyMultiredditChildStyleIfNeeded(tableView, (UITableViewCell *)self, [tableView indexPathForCell:(UITableViewCell *)self]);
     }
@@ -1737,6 +1783,7 @@ static void ApolloSubredditIndexInstallHeaderLayoutHook(void) {
 - (void)setHighlighted:(BOOL)highlighted animated:(BOOL)animated {
     %orig;
     UITableView *tableView = ApolloSubredditIndexTableForCell((UITableViewCell *)self);
+    if (!ApolloSubredditIndexTableAlreadyRecognised(tableView)) return;
     ApolloSubredditIndexApplyModernPressedCellSelectionChrome((UITableViewCell *)self);
     ApolloSubredditIndexSetModernPressOverlayVisible((UITableViewCell *)self, tableView, highlighted || ((UITableViewCell *)self).selected, animated);
     if (highlighted) {
@@ -1752,6 +1799,7 @@ static void ApolloSubredditIndexInstallHeaderLayoutHook(void) {
 - (void)setSelected:(BOOL)selected animated:(BOOL)animated {
     %orig;
     UITableView *tableView = ApolloSubredditIndexTableForCell((UITableViewCell *)self);
+    if (!ApolloSubredditIndexTableAlreadyRecognised(tableView)) return;
     ApolloSubredditIndexApplyModernPressedCellSelectionChrome((UITableViewCell *)self);
     ApolloSubredditIndexSetModernPressOverlayVisible((UITableViewCell *)self, tableView, selected || ((UITableViewCell *)self).highlighted, animated);
     if (selected) {
@@ -1770,8 +1818,10 @@ static void ApolloSubredditIndexInstallHeaderLayoutHook(void) {
     if (!redditListCellClass || ![(UITableViewCell *)self isKindOfClass:redditListCellClass]) return;
 
     UITableView *tableView = ApolloSubredditIndexTableForCell((UITableViewCell *)self);
-    if ([objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) {
+    if (ApolloSubredditIndexEnsureSelectionTable(tableView)) {
         ApolloSubredditIndexApplyCellSelectionChrome((UITableViewCell *)self, tableView);
+    }
+    if ([objc_getAssociatedObject(tableView, &kApolloSubredditIndexTableKey) boolValue]) {
         ApolloSubredditIndexInstallStarProxyForCell((UITableViewCell *)self, tableView);
     }
 }

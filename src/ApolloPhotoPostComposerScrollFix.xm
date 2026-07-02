@@ -824,7 +824,7 @@ static void ApolloMediaComposerPresentPickerWarning(id picker, NSString *title, 
     // picker's `presentingViewController` becomes nil and we can't find a host to present from.
     UIViewController *pickerController = [picker isKindOfClass:[UIViewController class]] ? (UIViewController *)picker : nil;
     UIWindow *initialWindow = nil;
-    for (UIWindow *window in [UIApplication.sharedApplication.windows reverseObjectEnumerator]) {
+    for (UIWindow *window in [ApolloAllWindows() reverseObjectEnumerator]) {
         if (window.isKeyWindow) { initialWindow = window; break; }
         if (!initialWindow && !window.hidden && window.alpha > 0.01) initialWindow = window;
     }
@@ -840,7 +840,7 @@ static void ApolloMediaComposerPresentPickerWarning(id picker, NSString *title, 
             UIViewController *baseController = weakPresenter;
             if (!baseController) {
                 UIWindow *retryWindow = nil;
-                for (UIWindow *window in [UIApplication.sharedApplication.windows reverseObjectEnumerator]) {
+                for (UIWindow *window in [ApolloAllWindows() reverseObjectEnumerator]) {
                     if (window.isKeyWindow) { retryWindow = window; break; }
                     if (!retryWindow && !window.hidden && window.alpha > 0.01) retryWindow = window;
                 }
@@ -1282,7 +1282,7 @@ static UIViewController *ApolloMediaComposerVisibleComposerController(void) {
     UIViewController *candidate = ApolloMediaComposerCanonicalBodyController(sApolloMediaComposerActiveBodyController);
     if (candidate) return candidate;
 
-    for (UIWindow *window in [UIApplication.sharedApplication.windows reverseObjectEnumerator]) {
+    for (UIWindow *window in [ApolloAllWindows() reverseObjectEnumerator]) {
         if (window.hidden || window.alpha < 0.01) continue;
         NSMutableArray<UIViewController *> *stack = [NSMutableArray array];
         if (window.rootViewController) [stack addObject:window.rootViewController];
@@ -1432,7 +1432,7 @@ static UITextView *ApolloMediaComposerFindVisibleBodyTextViewInView(UIView *root
 }
 
 static UITextView *ApolloMediaComposerFindVisibleBodyTextViewInWindows(void) {
-    NSArray<UIWindow *> *windows = UIApplication.sharedApplication.windows;
+    NSArray<UIWindow *> *windows = ApolloAllWindows();
     for (UIWindow *window in [windows reverseObjectEnumerator]) {
         UITextView *textView = ApolloMediaComposerFindVisibleBodyTextViewInView(window);
         if (ApolloMediaComposerTrimmedBodyText(ApolloMediaComposerNormalizedRawBodyText(textView.text)).length > 0) return textView;
@@ -1855,7 +1855,7 @@ static BOOL ApolloMediaComposerViewIsDescendantOfView(UIView *view, UIView *ance
 
 static BOOL ApolloMediaComposerTextViewIsInsideVisibleNativeEditor(UITextView *textView) {
     if (![textView isKindOfClass:[UITextView class]] || !textView.window) return NO;
-    for (UIWindow *window in [UIApplication.sharedApplication.windows reverseObjectEnumerator]) {
+    for (UIWindow *window in [ApolloAllWindows() reverseObjectEnumerator]) {
         UIViewController *visibleController = ApolloMediaComposerVisibleControllerFromController(window.rootViewController);
         if (!ApolloMediaComposerControllerLooksLikeNativeTextEditor(visibleController)) continue;
         if (ApolloMediaComposerViewIsDescendantOfView(textView, visibleController.view)) return YES;
@@ -2062,7 +2062,7 @@ static void ApolloMediaComposerApplyNativeEditorToolbarRestrictions(UIViewContro
     // The markdown toolbar is hosted as an inputAccessoryView, which UIKit places inside a
     // separate UIRemoteKeyboardWindow / UITextEffectsWindow rather than in the editor's view
     // tree. Walk every visible window's subview tree to catch it.
-    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+    for (UIWindow *window in ApolloAllWindows()) {
         if (window.hidden || window.alpha < 0.01) continue;
         if (window == editor.view.window) continue; // already walked via editor.view
         ApolloMediaComposerCollectButtonsInView(window, buttons, &budget);
@@ -2157,7 +2157,7 @@ static void ApolloMediaComposerMarkVisibleNativeBodyTextViews(UIViewController *
         markedCount = ApolloMediaComposerMarkNativeBodyTextViewsInView(controller.view, ownerController, reason);
         editorController = controller;
     } else {
-        NSArray<UIWindow *> *windows = UIApplication.sharedApplication.windows;
+        NSArray<UIWindow *> *windows = ApolloAllWindows();
         for (UIWindow *window in [windows reverseObjectEnumerator]) {
             UIViewController *visibleController = ApolloMediaComposerVisibleControllerFromController(window.rootViewController);
             if (!ApolloMediaComposerControllerLooksLikeNativeTextEditor(visibleController)) continue;
@@ -2590,7 +2590,8 @@ static UIViewController *ApolloMediaComposerActiveComposeControllerForToken(void
     UIViewController *tracked = ApolloMediaComposerCanonicalBodyController(sApolloMediaComposerActiveBodyController) ?: sApolloMediaComposerActiveBodyController;
     if (tracked) {
         NSString *cls = NSStringFromClass(tracked.class) ?: @"";
-        if ([cls hasSuffix:@"ComposePostViewController"] || [cls hasSuffix:@"ComposeViewController"]) {
+        if ([cls hasPrefix:@"_TtC6Apollo"] &&
+            ([cls hasSuffix:@"ComposePostViewController"] || [cls hasSuffix:@"ComposeViewController"])) {
             return tracked;
         }
     }
@@ -2604,7 +2605,8 @@ static UIViewController *ApolloMediaComposerActiveComposeControllerForToken(void
             NSUInteger guard = 0;
             while (vc && guard++ < 32) {
                 NSString *cls = NSStringFromClass(vc.class) ?: @"";
-                if ([cls hasSuffix:@"ComposePostViewController"] || [cls hasSuffix:@"ComposeViewController"]) {
+                if ([cls hasPrefix:@"_TtC6Apollo"] &&
+                    ([cls hasSuffix:@"ComposePostViewController"] || [cls hasSuffix:@"ComposeViewController"])) {
                     return vc;
                 }
                 vc = vc.presentedViewController;
@@ -2909,7 +2911,7 @@ static BOOL ApolloMediaComposerPresenterLooksLikeNativeBodyEditor(UIViewControll
     UIViewController *visibleFromPresenter = ApolloMediaComposerVisibleControllerFromController(presenter);
     if (ApolloMediaComposerControllerLooksLikeNativeTextEditor(visibleFromPresenter)) return YES;
 
-    NSArray<UIWindow *> *windows = UIApplication.sharedApplication.windows;
+    NSArray<UIWindow *> *windows = ApolloAllWindows();
     for (UIWindow *window in [windows reverseObjectEnumerator]) {
         UIViewController *visibleController = ApolloMediaComposerVisibleControllerFromController(window.rootViewController);
         if (ApolloMediaComposerControllerLooksLikeNativeTextEditor(visibleController)) return YES;
@@ -3281,12 +3283,16 @@ static void ApolloMediaComposerInstallComposeTableHooks(void) {
 
 - (void)viewDidLoad {
     %orig;
+    // Never treat Apple's out-of-process share/compose controllers as Apollo
+    // composers — traversing their remote view hierarchy crashes (issue #366).
+    if (ApolloIsSystemShareComposeController(self)) return;
     ApolloMediaComposerMarkContextActive(self, @"viewDidLoad");
     ApolloPhotoComposerRepairControllerSoon(self, @"viewDidLoad");
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     %orig;
+    if (ApolloIsSystemShareComposeController(self)) return;
     ApolloMediaComposerMarkContextActive(self, @"viewWillAppear");
     if (ApolloMediaComposerControllerLooksLikeNativeTextEditor(self)) {
         ApolloMediaComposerMarkVisibleNativeBodyTextViews(self, @"viewWillAppear-native-editor");
@@ -3298,6 +3304,7 @@ static void ApolloMediaComposerInstallComposeTableHooks(void) {
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
+    if (ApolloIsSystemShareComposeController(self)) { %orig; return; }
     ApolloMediaComposerMarkVisibleNativeBodyTextViews(self, @"viewWillDisappear");
     UIViewController *bodyController = ApolloMediaComposerCanonicalBodyController(self);
     if (bodyController) ApolloMediaComposerRestoreOriginalPostType(bodyController, NO, @"viewWillDisappear");
@@ -3306,6 +3313,7 @@ static void ApolloMediaComposerInstallComposeTableHooks(void) {
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
+    if (ApolloIsSystemShareComposeController(self)) return;
     ApolloMediaComposerMarkContextActive(self, @"viewDidAppear");
     NSString *className = NSStringFromClass(self.class);
     if (ApolloMediaComposerShouldBridgeVideoPicker() && ApolloPhotoComposerClassLooksLikeMediaPicker(className)) {
@@ -3325,6 +3333,7 @@ static void ApolloMediaComposerInstallComposeTableHooks(void) {
 
 - (void)viewDidLayoutSubviews {
     %orig;
+    if (ApolloIsSystemShareComposeController(self)) return;
     ApolloMediaComposerMarkContextActive(self, @"viewDidLayoutSubviews");
     if (ApolloMediaComposerControllerLooksLikeNativeTextEditor(self)) {
         ApolloMediaComposerMarkVisibleNativeBodyTextViews(self, @"viewDidLayoutSubviews-native-editor");
@@ -3333,7 +3342,9 @@ static void ApolloMediaComposerInstallComposeTableHooks(void) {
 }
 
 - (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(void (^)(void))completion {
-    ApolloPhotoComposerMaybeEnableMoviePicking(self, viewControllerToPresent);
+    if (!ApolloIsSystemShareComposeController(viewControllerToPresent)) {
+        ApolloPhotoComposerMaybeEnableMoviePicking(self, viewControllerToPresent);
+    }
     UIViewController *bodyController = ApolloMediaComposerCanonicalBodyController(self);
     %orig;
     (void)bodyController;
@@ -3360,6 +3371,7 @@ static void ApolloMediaComposerInstallComposeTableHooks(void) {
 
 - (void)viewDidDisappear:(BOOL)animated {
     %orig;
+    if (ApolloIsSystemShareComposeController(self)) return;
     NSString *className = NSStringFromClass(self.class);
     if (!ApolloPhotoComposerClassLooksLikeComposer(className)) return;
 

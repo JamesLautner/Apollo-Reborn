@@ -2,6 +2,159 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [v3.3.0] - 2026-06-26
+
+### Features
+
+- Add a **Theme Builder** in **Settings > Appearance > Themes** to create, save, and manage multiple custom themes that behave like Apollo's built-in themes, including importing and exporting themes to share them (#454: @jordanearle, @icpryde)
+- Add **AI Summaries** in **Settings > Apollo Reborn > Apollo AI** (off by default, iOS 26+) — generates post, discussion, and linked-article summaries entirely **on-device** using Apple's FoundationModels (#489, #491: @jordanearle, @icpryde)
+  - Post summaries appear in the comments header between the title and body, and discussion summaries appear above the first comment on larger threads; summaries stream in token-by-token and are cached to disk so reopening a thread is instant
+  - Includes per-type controls and a **Tap to Summarize** option that avoids auto-fetching a linked article's page until you ask for it
+- New experimental **API-Key-Free Mode** in **Settings > Apollo Reborn > API Keys** to use Apollo without API keys by signing in to reddit.com directly! Supports browsing, voting, commenting, and saving. (#442: @nickclyde)
+  - In this mode, images attached to comments and posts now upload straight to Reddit's own CDN instead of falling back to Imgur (#495: @nickclyde)
+- Add **multi-account credentials** so each signed-in account can use its own Reddit API key (or web session) instead of sharing one, with a redesigned account switcher to add, edit, reorder, and remove accounts, and support for Reddit "Web app" confidential clients (#505: @DeltAndy123)
+- Add **Picture-in-Picture** for videos and GIFs — a floating in-app miniplayer that keeps playing as you scroll through the comments (drag to reposition, swipe to hide, double-tap to resize), with optional handoff to the iOS system PiP so playback continues when you leave Apollo (#467: @JeffreyCA)
+- Add **Img Chest** as a media upload host in **Settings > Apollo Reborn > Media Upload Host** for single images and albums, with thumbnails and host labels in **Manage Uploads**, the ability to delete Img Chest uploads, and an improved album viewer with share, Save All, an accurate loading percentage, and swipe-to-dismiss (#434: @icpryde)
+- Revamp the **Subreddit Sidebar** to render new-Reddit's structured content above the existing markdown — community stats (subscribers and created date), a **Search by Flair** chip row that jumps straight to a flair's posts, related communities, resource links, and a table of contents (#462: @icpryde)
+- Add an opt-in **Community Highlights** carousel in **Settings > Apollo Reborn > Subreddits**, showing a subreddit's pinned posts as tappable cards at the top of the feed, with tap-to-collapse, spoiler blurring, and an optional **Load All Highlights** mode that surfaces the full set of pinned posts (#463, #499: @icpryde)
+- Expand **Filters & Blocks** with per-subreddit keyword and post-flair filters plus subreddit-name filtering that hides any subreddit whose name contains a word (e.g. `circlejerk`) across feeds and search (#507: @icpryde)
+- Improve **Direct Chat** with inline images, GIFs, and emoji/snoomoji in message bubbles, ImgChest-backed image sending, a recipient avatar in the composer, a **Direct Chat** inbox filter with avatars on every row, and an **Inline Media in Chat** toggle in **Settings > Media** (#488: @icpryde)
+- Add **Apple's on-device Translation** (iOS 18+) as a translation provider in **Settings > Translation > Primary Provider**, alongside Google and LibreTranslate (#460: @icpryde)
+- Show a user's **Social Links** on their profile page (#465, #496, #498: @icpryde)
+- Move **Rich Link Previews** into its own settings section with a combined Body, Comments, and Color sub-screen, and replace the preset card colors with a full color picker (grid, spectrum, sliders, eyedropper, hex) plus quick swatches, a live card preview, and exact full-fill card coloring with automatic text contrast (#504: @icpryde)
+- Add **Include Link** and **Share as Video** options to **Share as Image** — attach the post's Reddit link alongside the rendered image, or export the post as a video (#484: @icpryde)
+- Add **Inbox Comment Scroll** so tapping a reply in the Inbox lands on the linked comment instead of the top of the post (#457: @icpryde)
+- Improve the **user flair selector** to handle old (CSS-class) and emoji-based flair systems, add a custom-emoji picker, and show clearer empty states instead of errors or walls of blank rows (#474: @icpryde)
+- Show **moderator avatars** in the subreddit Mods list (#459: @icpryde)
+- Add **0.75× and 1.25× playback speeds** to the fullscreen video player (#476: @icpryde)
+- Add a **hold-for-2× gesture** — press and hold the right side of a fullscreen video to play at 2× while held, then release to restore the previous speed (#479: @icpryde)
+
+### Fixes
+
+- Replace the misleading **"Error Loading Notifications — contact developer"** alert on free-Apple-ID sideloads with a clear **Notifications Unavailable** explanation, since Apple only grants the push entitlement to paid Developer accounts, so push, watchers, and inbox alerts can never reach those builds; paid-account sideloads and App Store/jailbreak builds are detected and left untouched (#492: @federgilad)
+- Make **deleted comment recovery** faster and more reliable, with cleaner labels on recovered comments and a heads-up when enabling it that comments may load slower (#418: @nunoo)
+- Fix the tweak's settings screens only following the system light/dark mode instead of **Apollo's own color theme**, along with related cell coloring glitches when switching appearance (#440: @iCrazeiOS)
+- Keep a profile's **avatar, banner, bio, and social links** visible even when **Show User Profile Pictures** is turned off (#487: @icpryde)
+- Rework the **feed and subreddit search bar** so the navigation bar fully hides on iOS 26 instead of floating half-visible, and add an opt-in **Keep Search Bar In Place** mode in **Settings > Apollo Reborn > General** (#451: @icpryde)
+- Fix **link-preview card text** showing raw HTML entities like `&amp;` (#461: @icpryde)
+- Fix the **SUBREDDIT SUGGESTIONS** header overlapping the first row on the Search tab (#478: @icpryde)
+- Fix the **modern subreddit list** tinting the whole navigation bar when the Home row is selected (#453: @icpryde)
+- Fix the **profile-picture tab icon** greying out after opening a direct chat room from the Inbox (#458: @icpryde)
+- Fix the **translation globe** spacing in the Liquid Glass navigation bar (#455: @icpryde)
+- Fix **Pixel Pals** opening their menu over media, web views, and modals (#506: @icpryde)
+- Hide the redundant **GIF** caption beneath inline GIFs (#464: @icpryde)
+- Improve the **manual sign-in fallback** UI on older iOS versions (#480: @Alstruit)
+- Fix **Hide Mod Subreddits** stripping the moderator badge and mod tools when every moderated subreddit was hidden; the Subreddits list now filters display only, leaving the app-wide moderator roster intact (#500: @icpryde)
+- Restore the **follow-thread Live Activity** in the Reborn widgets so a self-hosted notification backend can render and update it again (#490: @nickclyde)
+- Show the **website name** on a link card when the scraped title is only numbers, instead of a bare number like a single-page app's match ID (#503: @icpryde)
+
+## [v3.2.0] - 2026-06-14
+
+### Features
+
+- New **Apollo Reborn Widgets** — nine Home Screen, Lock Screen, and StandBy widgets (Showerthoughts, Jokes, Post, Feed, Photo, Shortcuts, Apollo Actions, Calendar, and Headline) (#406: @jordanearle)
+  - Most widgets read Reddit through your API key: copy a one-time setup code from **Settings > Apollo Reborn > Copy Widget Setup Code** and paste it into any widget, and the rest pick it up automatically
+  - Tapping a widget opens the post or subreddit in Apollo; included in the standard build but not the no-extensions variant
+- Add a **Universal OAuth Sign-In** toggle in **Settings > Apollo Reborn** (on by default) to fall back to Apollo's native sign-in if the in-app login causes trouble, and ship released IPAs with the `dystopia` and `redreader` sign-in URL schemes already registered so the shared API key works without manually editing Info.plist (#432: @JeffreyCA)
+- Add a **manual sign-in fallback** for older iOS versions that can't load Reddit's login page, using an external browser and an Apollo Reborn userscript to paste a sign-in code back into Apollo (#430: @DeltAndy123; sign-in keyboard improvements by @Alstruit)
+- Add a **Text Post Thumbnails** toggle in **Settings > Apollo Reborn > Media** (on by default) — text posts that embed an image now show a thumbnail with a **Text Post** badge, and tapping it opens the image in the media viewer instead of the thread (#426: @icpryde)
+- Add **Hide Mod Subreddits** to remove moderated subreddits you can't leave from the Subreddits list — tap Edit, then the blue button to hide a subreddit and the green button to bring it back (#424: @icpryde)
+- Show **moderator reports** as native inline sections in the post and comment action menu (#412: @JeffreyCA)
+- Make the **banned-profile overlay** dismissable (#409: @JeffreyCA)
+- Combine cache-clearing options into one **Clear Tweak Caches** button under a renamed **Data** section (#409: @JeffreyCA)
+
+### Fixes
+
+- Show the **author avatar and subreddit icon** in **Share as Image** post exports, so the image matches what you see in the app (#438: @icpryde)
+- Fix several **link card glitches in feeds** — cards whose text overflowed into the post below, Bluesky posts losing their paragraph breaks, compact cards stuck at full height, and blank image areas on links whose thumbnail isn't ready yet (#427: @icpryde)
+- Fix **gallery GIFs** getting stuck on a loading spinner when swiping between items in an album (#404: @JeffreyCA)
+- Fix comment and post text showing a literal **`&#x200B;`** or an extra blank line at the end (#405: @JeffreyCA)
+- Fix **comment scrolling freezing** in threads that contain a link to removed media, such as a deleted `v.redd.it` video (#395: @JeffreyCA)
+- Fix spurious **"error :(" overlay** appearing over videos that play fine but whose preview image fails to load (#409: @JeffreyCA)
+- Fix **Live Activities** not updating on secret-protected self-hosted notification backends (#411: @nickclyde)
+- Fix an **installation conflict** when upgrading from some older versions (#401: @Alstruit)
+- Bundle **libFLEX inside the app** so rootless jailbreak users can keep the standalone libFLEX package installed without it conflicting with Apollo Reborn (#437: @iCrazeiOS)
+
+## [v3.1.1] - 2026-06-07
+
+- Fix a **crash when sharing a post to Messages or Mail** from the share sheet — the system compose controller was misidentified as an Apollo composer, leaving GIF-toolbar injection timers that dereferenced the dismissed share UI and crashed (#378: @nickclyde)
+- Fix **Reddit login on iOS 15** by automatically falling back to Old Reddit, and add an Old Reddit button to the auth view for users who need to switch manually (#377: @DeltAndy123)
+- Fix **video controls** overlay rendering, including the AirPlay button getting clipped or misaligned (#383: @JeffreyCA)
+- Fix **flair alignment** so post and user flairs no longer sit too low or clip their text (#389: @JeffreyCA)
+- Fix **Color Flairs** reverting to grey or the wrong shade after returning to Apollo from the background (#391: @icpryde)
+
+## [v3.1.0] - 2026-06-05
+
+### Features
+
+- Support **any custom redirect URI** for the Reddit API without patching the app's Info.plist, so custom URI schemes authenticate without the "address is invalid" error (also removes the need for LiveContainer users to patch manually) (#368: @DeltAndy123)
+- Add **GLASS Icons** and **No Extensions + GLASS Icons** distribution variants that bundle the Liquid Glass icon catalog without opting into the iOS 26 UI runtime (#317: @nackerr)
+- Add new **Glitched** (@bajader) and **Modern** / **Modern Alt** (@paulo1manso) Liquid Glass app icons (#353: @bajader, @paulo1manso)
+- **Restore logged-in accounts** when restoring a settings backup, so reinstalling no longer requires re-authenticating each Reddit account (#331: @nickclyde)
+- Add a **Subreddit List Enhancements** toggle in **Settings > Apollo Reborn Options > Subreddits** to fall back to Apollo's native list, working around misaligned rows and a broken index scrubber on some devices (#355: @JeffreyCA)
+- Add a **Color Flairs** option in **Settings > Apollo Reborn Options > General** to color post and user flairs using Reddit's flair colors (#360: @icpryde)
+- Add **Show Deleted Comments** to restore deleted or removed comments inline from archived copies when available (#300: @nunoo)
+- Render comments with **two or more link previews** as compact cards instead of stacking full hero cards (#344: @icpryde)
+- Show **feed thumbnails for text posts** that embed images but produce no native thumbnail, in both Large and Compact modes (#351: @icpryde)
+- Fade and disable the comment **image/GIF buttons** when a subreddit doesn't allow that media type, instead of failing only at submit time (#356: @icpryde)
+- Add a separate **Autoplay Inline GIFs** setting in **Settings > Apollo Reborn Options > Media** to control inline GIF autoplay independently of Apollo's native Autoplay GIFs/Videos setting (#365: @JeffreyCA)
+- Ship an Apollo-Reborn **userscript** and an **"Open in Apollo" Shortcut** recipe as app-independent ways to open Reddit links in Apollo from any browser, handy for the no-extensions variant (#307: @nickclyde)
+
+### Fixes
+
+- Fix the bundled **"Open in Apollo" Safari extension**, which stopped opening links on sideloaded builds — its default "Automatic" mode redirected through `openinapollo.com`, whose auto-open only works for the App Store build. It now redirects straight to `apollo://` and handles `/s/` share links (#307: @nickclyde)
+- Fix the bundled **"Open in Apollo" share-sheet action** so it opens Reddit links in Apollo from **any** browser (Chrome, Firefox, Edge, Brave…), not just Safari, replacing a deprecated call that iOS 18+ refused to run. On iOS 26 the extension only launches if your installer sets the appex main-binary flag — **AltStore/SideStore** do, **Sideloadly/Feather** don't, where the Shortcut remains a signer-independent fallback (#307: @nickclyde)
+- Fix **Recently Read** showing no posts after a Reddit API change (#341: @JeffreyCA)
+- Fix inline **Reddit GIFs in comments** staying frozen instead of autoplaying until collapsed/expanded or refreshed (#349: @icpryde)
+- Fix inline **GIFs not autoplaying on cellular** when Autoplay GIFs/Videos is set to Always (#347: @JeffreyCA)
+- Fix the inline **video play button** missing on post-body Reddit videos and a clipped AirPlay icon (#350: @icpryde)
+- Fix laggy **subreddit header** scrolling and incorrect handling on non-subreddit feeds (#339: @JeffreyCA)
+- Fix **Share as Image** not opening under the iOS 26 native action menu (#335: @icpryde)
+- Fix the **Rich Link Previews – Body** setting having no effect and following the Comments setting instead (#329: @nickclyde)
+- Fix a crash in the banned-profile hook (#326: @JeffreyCA)
+- Fix a crash when navigating into comments from a dangling host pointer in inline image cleanup (#362: @JeffreyCA)
+
+## [v3.0.0] - 2026-05-29
+
+### Features
+
+- Post **GIFs in comments**: a new **Gif** button in the compose toolbar opens a built-in Giphy browser (trending + search) and uploads selected GIFs natively to Reddit (#276: @icpryde)
+    - Requires a free Giphy API key — set it in **Settings > Custom API > API Keys > Giphy API Key**. See the in-app **Giphy & ImgChest API Key Setup** guide for instructions (#285: @icpryde)
+    - Inline playback honors **Settings > General > Autoplay GIFs/Videos** with a static cover + play overlay when paused
+- Add **Image Chest** inline album support: bare Image Chest links show the first image inline and open an in-app album viewer with tap-to-hide controls, idle auto-hide, and per-image pinch zoom (#241: @icpryde)
+    - To set up Image Chest, create an account at https://imgchest.com, generate an API token at https://imgchest.com/profile/api, and paste it into **Img Chest API Key** under **Settings > Custom API > API Keys**
+- Add **Subreddit Headers**: view subreddit banners and display icons on subreddit pages, with optional tap-to-set custom local images that can be reset anytime in Settings (#266: @jordanearle, @icpryde)
+- Compact **u/username** and **r/subreddit** cards in rich link previews show avatar/icon, display name, member count, and an about snippet, with long-press peek into the native profile/community view (#262: @icpryde)
+- Long-press peek now works on usernames and subreddit links in threads and comments (#262: @icpryde)
+- Show **banned profile state** with a dead Snoo overlay on user profiles, and surface comment author hints for banned/suspended users (#271, #278: @icpryde, @jordanearle)
+- Add **editable user flair text** support to Apollo's flair selector (#255: @nunoo)
+- Rich link previews now support translation alongside the rest of post and comment content (#262: @icpryde)
+- Subreddit list (Modern mode) polish (#262: @icpryde)
+- Add **41 new Liquid Glass icon variants** by @jryng under a new **New Variants** group, plus new **Aperture Science** and **ApollOS** icon sets by @bajader, and reorganize the in-app App Icon picker into groups to reduce clutter (#287, #254: @DeltAndy123, @jryng, @bajader)
+- Add **Inline Media Alignment** option in **Settings > Custom API > Media** to left-align, center, or right-align inline images that don't fill the full content width (#273: @lampemw)
+- Rename **Custom API** to **Apollo Reborn Options** in Settings, polish the **Thanks To** screen with maintainer/code/icon & design groupings sourced from `contributors.json`, and add an **Apollo Reborn Subreddit** row that opens r/ApolloReborn in-app (#294: @icpryde)
+- **Mask API keys** in Custom API settings: Reddit, Reddit Secret, Imgur, Img Chest, and Giphy fields show dots when idle and reveal only while editing (#276: @icpryde)
+- Add **Buy Us a Coffee** screen in Settings with maintainer links, and move Apollo's original **Tip Jar** to **Settings > About** above **What's New** (#294: @icpryde)
+
+### Fixes
+
+- Fix scroll freeze / loading-spinner lockup while scrolling threads with rich link previews (#262: @icpryde)
+- Fix comment layout shifting around as user avatars load in (#262: @icpryde)
+- Replace placeholder filler text in rich link previews with skeleton loading bars, and reduce flicker when previews reappear (#262: @icpryde)
+- Fix a stray translucent star/blob on rich link previews when using Share as Image (#262: @icpryde)
+- Fix visionOS (Vision Pro) use-after-free crash on multireddits (#270: @rebelancap)
+- Fix X and Edit buttons touching the top of the account switcher popup on Liquid Glass (#275: @lampemw)
+- General stability improvements around rapid subreddit navigation and image loading (#262, #266: @icpryde, @jordanearle)
+- Smoother scrolling through threads with lots of rich link previews (#262: @icpryde)
+- Keep user profile cards and peek previews up to date when an account is suspended or banned (#278: @jordanearle, @icpryde)
+- Fix launch crash when opening a banned user's profile (#276: @icpryde)
+- Fix crash on Reddit link previews in some comment threads (#276, #280: @JeffreyCA, @icpryde)
+- Fix Reddit-hosted GIFs stopping animation after leaving and returning to a thread (#276: @icpryde)
+- Fix Giphy GIFs posted from Apollo not rendering in the official Reddit iOS app (and showing a "image was probably deleted" placeholder when editing in Apollo) (#289: @icpryde)
+- Fix Compact link preview cards growing to hero size and overlapping the next comment after voting on a comment that contains a link (#290: @icpryde)
+
 ## [v2.14.0] - 2026-05-20
 
 ### Features
@@ -429,6 +582,11 @@ There are currently a few limitations:
 ## [v1.0.0] - 2023-10-13
 - Initial release
 
+[v3.3.0]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v1.15.11_3.2.0...v1.15.11_3.3.0
+[v3.2.0]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v1.15.11_3.1.1...v1.15.11_3.2.0
+[v3.1.1]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v1.15.11_3.1.0...v1.15.11_3.1.1
+[v3.1.0]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v1.15.11_3.0.0...v1.15.11_3.1.0
+[v3.0.0]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v2.14.0...v1.15.11_3.0.0
 [v2.14.0]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v2.13.0...v2.14.0
 [v2.13.0]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v2.12.0b...v2.13.0
 [v2.12.0b]: https://github.com/Apollo-Reborn/Apollo-Reborn/compare/v2.11.0...v2.12.0b

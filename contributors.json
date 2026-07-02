@@ -5,11 +5,13 @@
   "contributors": [
     {
       "role": "maintainer",
-      "github": "JeffreyCA"
+      "github": "JeffreyCA",
+      "buyMeACoffeeUrl": "https://buymeacoffee.com/jeffreyca"
     },
     {
       "role": "maintainer",
-      "github": "icpryde"
+      "github": "icpryde",
+      "buyMeACoffeeUrl": "https://buymeacoffee.com/icpryde"
     },
     {
       "role": "maintainer",
@@ -68,6 +70,30 @@
       "github": "epheterson"
     },
     {
+      "role": "code",
+      "github": "nunoo"
+    },
+    {
+      "role": "code",
+      "github": "lampemw"
+    },
+    {
+      "role": "code",
+      "github": "rebelancap"
+    },
+    {
+      "role": "code",
+      "github": "nackerr"
+    },
+    {
+      "role": "code",
+      "github": "Alstruit"
+    },
+    {
+      "role": "code",
+      "github": "federgilad"
+    },
+    {
       "role": "design",
       "github": "iGerman00"
     },
@@ -82,6 +108,10 @@
     {
       "role": "design",
       "github": "metalnakls"
+    },
+    {
+      "role": "design",
+      "github": "paulo1manso"
     },
     {
       "role": "design",

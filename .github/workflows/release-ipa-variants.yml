@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   build-release:
-    name: Build four IPA variants
+    name: Build six IPA variants
     runs-on: macos-15
     permissions:
       contents: write
@@ -42,6 +42,10 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           submodules: recursive
+          # The source push at the end uses a GitHub App token that can bypass
+          # the protected main ruleset. Do not persist checkout's GITHUB_TOKEN
+          # auth header, or Git may push as github-actions[bot] instead.
+          persist-credentials: false
 
       - name: Install build dependencies
         run: brew install ldid dpkg make
@@ -56,6 +60,9 @@ jobs:
           ref: 9bc73406cf80b711ef4d02c15ff1dedc4478a275 # master @ 2026-04-09
           path: theos
           submodules: recursive
+
+      - name: Select Xcode 26.0.1
+        run: sudo xcode-select -s /Applications/Xcode_26.0.1.app
 
       - name: Build rootful tweak package
         run: make package FINALPACKAGE=1
@@ -72,6 +79,9 @@ jobs:
           fi
           echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
           echo "Rootful tweak: $DEB_PATH"
+
+      - name: Collect rootful debug symbols
+        run: bash ./scripts/collect-debug-symbols.sh --label rootful --output-dir ./dist/symbols
 
       - name: Clean before rootless build
         run: make clean
@@ -94,6 +104,9 @@ jobs:
           mv "$ROOTLESS_DEB" "$ROOTLESS_RENAMED"
           echo "Rootless tweak: $ROOTLESS_RENAMED"
 
+      - name: Collect rootless debug symbols
+        run: bash ./scripts/collect-debug-symbols.sh --label rootless --output-dir ./dist/symbols
+
       - name: Install cyan
         run: |
           # cyan (the IPA injector) is not on PyPI under that name; the PyPI
@@ -111,17 +124,19 @@ jobs:
           "$RUNNER_TEMP/cyan-venv/bin/cyan" --help >/dev/null
           echo "cyan installed: $RUNNER_TEMP/cyan-venv/bin/cyan"
 
+      - name: Install xcodegen
+        run: |
+          # Required so build_release_variants.sh can build + inject the Reborn
+          # widget extension into the extension-bearing variants (standard/Glass/
+          # GlassIcons). Without xcodegen the script's guard silently skips
+          # widgets and the release would ship widget-less.
+          brew install xcodegen
+          xcodegen --version
+
       - name: Download Apollo IPA
         run: |
           curl -L --fail --retry 3 "${{ github.event.inputs.apollo_ipa_url }}" -o Apollo.ipa
           unzip -t Apollo.ipa >/dev/null
-
-      - name: Build IPA variants
-        run: |
-          bash ./scripts/build_release_variants.sh \
-            --ipa ./Apollo.ipa \
-            --deb "${{ steps.rootful_deb.outputs.deb_path }}" \
-            --output-dir ./dist/out
 
       - name: Collect metadata
         id: meta
@@ -135,7 +150,9 @@ jobs:
             echo "Error: could not determine Apollo version from Apollo.ipa" >&2
             exit 1
           fi
-          TWEAK_VERSION=$(sed -n 's/^Version: //p' control | sed 's/~/-/g')
+          # Use the semantic tweak version for the tag/name/IPA, dropping the
+          # trailing dpkg packaging revision in control (e.g. 2.14.0-33 -> 2.14.0).
+          TWEAK_VERSION=$(sed -n 's/^Version: //p' control | sed 's/~/-/g' | sed -E 's/-[0-9]+$//')
           TAG_NAME="v${APOLLO_VERSION}_${TWEAK_VERSION}"
           RELEASE_NAME="Apollo v${APOLLO_VERSION} with Apollo-Reborn v${TWEAK_VERSION}"
           echo "apollo_version=${APOLLO_VERSION}" >> "$GITHUB_OUTPUT"
@@ -143,29 +160,42 @@ jobs:
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
           echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Generate release notes
+      - name: Validate release inputs
+        run: python3 ./scripts/validate_release_inputs.py "${{ steps.meta.outputs.apollo_version }}"
+
+      - name: Build IPA variants
         run: |
-          cat > RELEASE_NOTES.md <<EOF
-          Apollo version: \`v${{ steps.meta.outputs.apollo_version }}\`
-          Apollo-Reborn version: \`v${{ steps.meta.outputs.tweak_version }}\`
+          bash ./scripts/build_release_variants.sh \
+            --ipa ./Apollo.ipa \
+            --deb "${{ steps.rootful_deb.outputs.deb_path }}" \
+            --output-dir ./dist/out
 
-          ## Included IPA variants
+      - name: Validate IPA variants
+        run: bash ./scripts/validate_release_variants.sh ./dist/out
 
-          - Standard injected IPA
-          - No Extensions injected IPA
-          - Standard injected IPA + Liquid Glass patch
-          - No Extensions injected IPA + Liquid Glass patch
+      - name: Collect widget debug symbols
+        run: |
+          WIDGET_DSYM="widgets/build/Build/Products/Release-iphoneos/ApolloRebornWidgets.appex.dSYM"
+          if [ ! -d "$WIDGET_DSYM" ]; then
+            echo "Error: missing widget dSYM: $WIDGET_DSYM" >&2
+            exit 1
+          fi
+          mkdir -p ./dist/symbols/widgets
+          cp -R "$WIDGET_DSYM" ./dist/symbols/widgets/
 
-          ## Included tweak packages
+      - name: Archive debug symbols
+        id: symbols
+        run: |
+          SYMBOLS_ZIP="dist/Apollo-Reborn-${{ steps.meta.outputs.tweak_version }}-dSYMs.zip"
+          (cd dist && zip -qry "$(basename "${SYMBOLS_ZIP}")" symbols)
+          echo "symbols_zip=${SYMBOLS_ZIP}" >> "$GITHUB_OUTPUT"
+          echo "Debug symbols: ${SYMBOLS_ZIP} ($(wc -c < "${SYMBOLS_ZIP}") bytes)"
 
-          - Rootful `.deb`
-          - Rootless `.deb`
-
-          ## Variant notes
-
-          - **No Extensions** removes Apollo's bundled app extensions so the sideloaded app uses 1 App ID instead of 7.
-          - **GLASS** applies the iOS 26 Liquid Glass binary patch and installs the bundled Liquid Glass icon catalog from this repo.
-          EOF
+      - name: Generate release notes
+        run: python3 ./scripts/generate_release_notes.py > RELEASE_NOTES.md
+        env:
+          APOLLO_VERSION: ${{ steps.meta.outputs.apollo_version }}
+          TWEAK_VERSION: ${{ steps.meta.outputs.tweak_version }}
 
       - name: Create release
         uses: softprops/action-gh-release@c062e08bd532815e2082a85e87e3ef29c3e6d191 # v2.0.8
@@ -178,6 +208,50 @@ jobs:
           files: |
             dist/out/*.ipa
             packages/*.deb
+            ${{ steps.symbols.outputs.symbols_zip }}
+
+      - name: Summarize release outputs
+        run: |
+          BUILD_VERSION=$(python3 -c 'import json; print(json.load(open("distribution/config.json", encoding="utf-8"))["app"]["buildVersion"])')
+          {
+            echo "## Release"
+            echo ""
+            echo "- Tag: \`${{ steps.meta.outputs.tag_name }}\`"
+            echo "- Name: \`${{ steps.meta.outputs.release_name }}\`"
+            echo "- Apollo version: \`${{ steps.meta.outputs.apollo_version }}\`"
+            echo "- Apollo-Reborn version: \`${{ steps.meta.outputs.tweak_version }}\`"
+            echo "- Build version: \`${BUILD_VERSION}\`"
+            echo ""
+            echo "## IPA assets"
+            echo ""
+            for ipa in dist/out/*.ipa; do
+              echo "- \`$(basename "$ipa")\` ($(du -h "$ipa" | cut -f1))"
+            done
+            echo ""
+            echo "## Debug symbols"
+            echo ""
+            echo "- \`$(basename "${{ steps.symbols.outputs.symbols_zip }}")\` ($(du -h "${{ steps.symbols.outputs.symbols_zip }}" | cut -f1))"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Summarize source URLs
+        # Only when this run actually regenerates/publishes the sources. Drafts
+        # (and runs that skip the source update) would otherwise advertise
+        # apps.json/manifest URLs for a release that has not been published.
+        if: github.ref == 'refs/heads/main' && inputs.update_sources && !inputs.draft
+        run: |
+          {
+            echo ""
+            echo "## Source URLs"
+            echo ""
+            python3 - <<'PY'
+          import json
+          config = json.load(open("distribution/config.json", encoding="utf-8"))
+          base = config["distribution"]["sourceBaseURL"].rstrip("/")
+          for variant in config["variants"]:
+              print(f"- `{base}/{variant['output']}`")
+          print(f"- `{base}/{config['distribution']['manifestOutput']}`")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Update source JSON files
         # Inline update for the automated path (draft=false dispatch). Skipped
@@ -210,12 +284,23 @@ jobs:
         run: |
           git config user.name "apollo-source-updater[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps.json apps_noext.json apps_glass.json apps_noext_glass.json release-manifest.json
+          git add apps.json apps_noext.json apps_glass.json apps_noext_glass.json \
+                  apps_glass_icons.json apps_noext_glass_icons.json release-manifest.json
           if git diff --cached --quiet; then
             echo "No source JSON changes to commit."
             exit 0
           fi
           git commit -m "Update distribution sources for ${{ steps.meta.outputs.tag_name }}"
+          git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git pull --rebase origin main
           git push origin HEAD:main
+          # Capture the SHA after the push so the summary reflects what actually
+          # landed on main; the rebase above can replay the commit to a new SHA.
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          {
+            echo ""
+            echo "## Source update"
+            echo ""
+            echo "- Commit: \`${SOURCE_COMMIT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -7,6 +7,10 @@ NSString * const ApolloSubredditNameKey = @"subredditName";
 
 static NSTimeInterval const ApolloSubredditInfoCacheTTL = 7.0 * 24.0 * 60.0 * 60.0;
 static NSUInteger const ApolloSubredditInfoDiskCacheMaxEntries = 800;
+// Cap stored about text: an empty public_description falls back to the full
+// sidebar markdown, and measuring/drawing thousands of chars makes scrolling
+// near the header laggy. We only ever show a few lines anyway.
+static NSUInteger const ApolloSubredditAboutTextMaxLength = 500;
 
 NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     if (subscriberCount < 0) return @"";
@@ -125,6 +129,26 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     return string.length > 0 ? string : nil;
 }
 
+// Clean + cap the about text on a word boundary with an ellipsis.
+- (NSString *)cleanAboutTextFromValue:(id)value {
+    NSString *string = [self cleanStringFromValue:value];
+    if (string.length <= ApolloSubredditAboutTextMaxLength) return string;
+
+    NSString *truncated = [string substringToIndex:ApolloSubredditAboutTextMaxLength];
+    // Snap the cut to a word boundary, else a grapheme boundary, so we never
+    // split a surrogate pair / composed character and leave a stray glyph.
+    NSRange lastSpace = [truncated rangeOfCharacterFromSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]
+                                                   options:NSBackwardsSearch];
+    if (lastSpace.location != NSNotFound && lastSpace.location > ApolloSubredditAboutTextMaxLength / 2) {
+        truncated = [truncated substringToIndex:lastSpace.location];
+    } else {
+        NSRange safe = [string rangeOfComposedCharacterSequenceAtIndex:ApolloSubredditAboutTextMaxLength];
+        truncated = [string substringToIndex:safe.location];
+    }
+    truncated = [truncated stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return [truncated stringByAppendingString:@"\u2026"];
+}
+
 - (BOOL)isFreshInfo:(ApolloSubredditInfo *)info {
     if (!info.fetchedAt) return NO;
     return fabs([info.fetchedAt timeIntervalSinceNow]) < ApolloSubredditInfoCacheTTL;
@@ -142,6 +166,11 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     if (info.subscriberCount >= 0) {
         dict[@"subscriberCount"] = @(info.subscriberCount);
     }
+    if (info.commentMediaInfoAvailable) {
+        dict[@"commentMediaInfoAvailable"] = @(YES);
+        dict[@"allowsImageComments"] = @(info.allowsImageComments);
+        dict[@"allowsGifComments"] = @(info.allowsGifComments);
+    }
     return dict;
 }
 
@@ -152,7 +181,7 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     if (subredditName.length == 0) return nil;
 
     NSString *displayName = [self cleanStringFromValue:dict[@"displayName"]];
-    NSString *aboutText = [self cleanStringFromValue:dict[@"aboutText"]];
+    NSString *aboutText = [self cleanAboutTextFromValue:dict[@"aboutText"]];
     NSURL *iconURL = [self URLFromString:dict[@"iconURL"]];
     NSURL *bannerURL = [self URLFromString:dict[@"bannerURL"]];
     NSInteger subscriberCount = -1;
@@ -164,13 +193,17 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
     NSDate *fetchedAt = timestamp > 0 ? [NSDate dateWithTimeIntervalSince1970:timestamp] : [NSDate distantPast];
     if (!dict[@"displayName"] && !dict[@"aboutText"]) fetchedAt = [NSDate distantPast];
 
-    return [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
+    ApolloSubredditInfo *info = [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
                                                   displayName:displayName
                                                     aboutText:aboutText
                                                       iconURL:iconURL
                                                     bannerURL:bannerURL
                                               subscriberCount:subscriberCount
                                                     fetchedAt:fetchedAt];
+    info.commentMediaInfoAvailable = [dict[@"commentMediaInfoAvailable"] boolValue];
+    info.allowsImageComments = [dict[@"allowsImageComments"] boolValue];
+    info.allowsGifComments = [dict[@"allowsGifComments"] boolValue];
+    return info;
 }
 
 - (void)pruneDiskInfoLocked {
@@ -270,8 +303,8 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
         [self cleanStringFromValue:dataDict[@"display_name_prefixed"]] ?:
         [self cleanStringFromValue:dataDict[@"display_name"]] ?:
         subredditName;
-    NSString *aboutText = [self cleanStringFromValue:dataDict[@"public_description"]] ?:
-        [self cleanStringFromValue:dataDict[@"description"]];
+    NSString *aboutText = [self cleanAboutTextFromValue:dataDict[@"public_description"]] ?:
+        [self cleanAboutTextFromValue:dataDict[@"description"]];
     NSURL *iconURL = [self URLFromString:dataDict[@"icon_img"]] ?:
         [self URLFromString:dataDict[@"community_icon"]];
     NSURL *bannerURL = [self URLFromString:dataDict[@"banner_img"]] ?:
@@ -283,13 +316,34 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
         subscriberCount = [subscriberValue integerValue];
     }
 
-    return [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
+    ApolloSubredditInfo *info = [[ApolloSubredditInfo alloc] initWithSubredditName:subredditName
                                                   displayName:displayName
                                                     aboutText:aboutText
                                                       iconURL:iconURL
                                                     bannerURL:bannerURL
                                               subscriberCount:subscriberCount
                                                     fetchedAt:[NSDate date]];
+
+    // `allowed_media_in_comments` is an array of permitted media kinds for
+    // comments. Absent/empty means no media is allowed. Values seen in the wild:
+    // "static" (uploaded images), "animated" (uploaded gifs), "giphy" (Giphy
+    // GIFs), "expression" (collectibles). The image-upload button covers
+    // static/animated; the Giphy button covers giphy.
+    id mediaValue = dataDict[@"allowed_media_in_comments"];
+    if ([mediaValue isKindOfClass:[NSArray class]]) {
+        info.commentMediaInfoAvailable = YES;
+        for (id entry in (NSArray *)mediaValue) {
+            if (![entry isKindOfClass:[NSString class]]) continue;
+            NSString *kind = [(NSString *)entry lowercaseString];
+            if ([kind isEqualToString:@"static"] || [kind isEqualToString:@"animated"]) {
+                info.allowsImageComments = YES;
+            } else if ([kind isEqualToString:@"giphy"]) {
+                info.allowsGifComments = YES;
+            }
+        }
+    }
+
+    return info;
 }
 
 - (void)finishRequestForKey:(NSString *)key info:(ApolloSubredditInfo *)info {
@@ -354,6 +408,18 @@ NSString *ApolloSubredditFormattedMemberCount(NSInteger subscriberCount) {
 
 - (void)refetchInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion {
     [self enqueueRequestForSubreddit:subredditName forceRefresh:YES completion:completion];
+}
+
+- (void)requestCommentMediaInfoForSubreddit:(NSString *)subredditName completion:(void (^)(ApolloSubredditInfo *info))completion {
+    ApolloSubredditInfo *cached = [self cachedInfoForSubreddit:subredditName];
+    if (cached && [self isFreshInfo:cached] && cached.commentMediaInfoAvailable) {
+        if (completion) completion(cached);
+        return;
+    }
+    // Fresh entry missing the comment-media field (older disk cache) → force a
+    // refetch so we don't keep serving incomplete data.
+    BOOL forceRefresh = (cached != nil && !cached.commentMediaInfoAvailable);
+    [self enqueueRequestForSubreddit:subredditName forceRefresh:forceRefresh completion:completion];
 }
 
 - (void)clearAllCaches {
