@@ -537,21 +537,71 @@ static BOOL ApolloShareLinkAlreadyHasLinkSource(NSArray *items) {
 
 %end
 
-// Temporary diagnostic for Apollo's custom Copy Link activity.
+// Apollo's custom Copy Link activity receives our correctly rewritten NSURL,
+// but its stock performActivity ignores that item and copies a private stale URL.
+// Cache the supplied URL, then write it directly when Copy Link is selected.
+static char kApolloCopyURLActivityURLKey;
+
 %hook _TtC6Apollo15CopyURLActivity
 
+- (BOOL)canPerformWithActivityItems:(NSArray *)activityItems {
+    NSURL *rewrittenURL = nil;
+
+    if ([activityItems isKindOfClass:[NSArray class]]) {
+        for (id item in activityItems) {
+            if ([item isKindOfClass:[NSURL class]]) {
+                rewrittenURL = ApolloShareLinkRewriteURLForCurrentHost((NSURL *)item);
+                break;
+            }
+
+            if ([item isKindOfClass:[NSString class]]) {
+                NSString *rewrittenString =
+                    ApolloShareLinkRewriteStringForCurrentHost((NSString *)item);
+                NSURL *candidate = [NSURL URLWithString:rewrittenString];
+
+                if (candidate.scheme.length > 0 && candidate.host.length > 0) {
+                    rewrittenURL = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (rewrittenURL) {
+        objc_setAssociatedObject(self,
+                                 &kApolloCopyURLActivityURLKey,
+                                 rewrittenURL,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        ApolloLog(@"[ShareLinkHost] CopyURLActivity cached URL=%@",
+                  rewrittenURL.absoluteString);
+    } else {
+        objc_setAssociatedObject(self,
+                                 &kApolloCopyURLActivityURLKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    return %orig;
+}
+
 - (void)performActivity {
-    UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
+    NSURL *rewrittenURL =
+        objc_getAssociatedObject(self, &kApolloCopyURLActivityURLKey);
 
-    ApolloLog(@"[ShareLinkHost] CopyURLActivity performActivity BEFORE url=%@ string=%@",
-              pasteboard.URL,
-              pasteboard.string);
+    if (![rewrittenURL isKindOfClass:[NSURL class]]) {
+        ApolloLog(@"[ShareLinkHost] CopyURLActivity had no cached URL; using stock behavior");
+        %orig;
+        return;
+    }
 
+    // Preserve Apollo's normal Copy Link behavior, then correct the final
+    // pasteboard value using the URL captured from the rewritten share items.
     %orig;
+    [UIPasteboard generalPasteboard].URL = rewrittenURL;
 
-    ApolloLog(@"[ShareLinkHost] CopyURLActivity performActivity AFTER url=%@ string=%@",
-              pasteboard.URL,
-              pasteboard.string);
+    ApolloLog(@"[ShareLinkHost] CopyURLActivity replaced copied URL=%@",
+              rewrittenURL.absoluteString);
 }
 
 %end
