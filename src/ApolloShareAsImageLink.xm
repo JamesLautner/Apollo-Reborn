@@ -540,34 +540,18 @@ static BOOL ApolloShareLinkAlreadyHasLinkSource(NSArray *items) {
 // Temporary diagnostic for Apollo's custom Copy Link activity.
 %hook _TtC6Apollo15CopyURLActivity
 
-- (BOOL)canPerformWithActivityItems:(NSArray *)activityItems {
-    NSUInteger itemCount = [activityItems isKindOfClass:[NSArray class]] ? activityItems.count : 0;
-    ApolloLog(@"[ShareLinkHost] CopyURLActivity canPerform itemCount=%lu",
-              (unsigned long)itemCount);
+- (void)performActivity {
+    UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
 
-    if ([activityItems isKindOfClass:[NSArray class]]) {
-        [activityItems enumerateObjectsUsingBlock:^(id item, NSUInteger index, BOOL *stop) {
-            NSString *className = item ? NSStringFromClass([item class]) : @"(nil)";
-            NSString *value = nil;
+    ApolloLog(@"[ShareLinkHost] CopyURLActivity performActivity BEFORE url=%@ string=%@",
+              pasteboard.URL,
+              pasteboard.string);
 
-            @try {
-                value = [item description];
-            } @catch (__unused NSException *e) {
-                value = @"<description threw exception>";
-            }
+    %orig;
 
-            ApolloLog(@"[ShareLinkHost] CopyURLActivity item[%lu] class=%@ isURL=%d isString=%d value=%@",
-                      (unsigned long)index,
-                      className,
-                      (int)[item isKindOfClass:[NSURL class]],
-                      (int)[item isKindOfClass:[NSString class]],
-                      value ?: @"(null)");
-        }];
-    }
-
-    BOOL result = %orig;
-    ApolloLog(@"[ShareLinkHost] CopyURLActivity canPerform result=%d", (int)result);
-    return result;
+    ApolloLog(@"[ShareLinkHost] CopyURLActivity performActivity AFTER url=%@ string=%@",
+              pasteboard.URL,
+              pasteboard.string);
 }
 
 %end
