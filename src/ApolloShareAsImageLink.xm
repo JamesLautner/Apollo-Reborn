@@ -537,6 +537,41 @@ static BOOL ApolloShareLinkAlreadyHasLinkSource(NSArray *items) {
 
 %end
 
+// Temporary diagnostic for Apollo's custom Copy Link activity.
+%hook _TtC6Apollo15CopyURLActivity
+
+- (BOOL)canPerformWithActivityItems:(NSArray *)activityItems {
+    NSUInteger itemCount = [activityItems isKindOfClass:[NSArray class]] ? activityItems.count : 0;
+    ApolloLog(@"[ShareLinkHost] CopyURLActivity canPerform itemCount=%lu",
+              (unsigned long)itemCount);
+
+    if ([activityItems isKindOfClass:[NSArray class]]) {
+        [activityItems enumerateObjectsUsingBlock:^(id item, NSUInteger index, BOOL *stop) {
+            NSString *className = item ? NSStringFromClass([item class]) : @"(nil)";
+            NSString *value = nil;
+
+            @try {
+                value = [item description];
+            } @catch (__unused NSException *e) {
+                value = @"<description threw exception>";
+            }
+
+            ApolloLog(@"[ShareLinkHost] CopyURLActivity item[%lu] class=%@ isURL=%d isString=%d value=%@",
+                      (unsigned long)index,
+                      className,
+                      (int)[item isKindOfClass:[NSURL class]],
+                      (int)[item isKindOfClass:[NSString class]],
+                      value ?: @"(null)");
+        }];
+    }
+
+    BOOL result = %orig;
+    ApolloLog(@"[ShareLinkHost] CopyURLActivity canPerform result=%d", (int)result);
+    return result;
+}
+
+%end
+
 // The Share-as-Image preview is hosted in a custom bottom-sheet presentation
 // controller that sizes the sheet to Apollo's native content. We add an extra
 // "Include Link" row, so ask the controller for one row more height (extending the
