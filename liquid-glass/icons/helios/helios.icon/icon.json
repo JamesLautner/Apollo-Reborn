@@ -21,11 +21,11 @@
         {
           "blend-mode-specializations" : [
             {
-              "value" : "screen"
+              "value" : "normal"
             },
             {
               "appearance" : "dark",
-              "value" : "lighten"
+              "value" : "normal"
             }
           ],
           "fill-specializations" : [
@@ -61,6 +61,7 @@
           }
         },
         {
+          "blend-mode" : "plus-lighter",
           "fill" : {
             "automatic-gradient" : "display-p3:0.89418,0.06660,0.83887,1.00000"
           },
@@ -209,20 +210,7 @@
       },
       "translucency" : {
         "enabled" : true,
-        "value" : 0.5
-      }
-    },
-    {
-      "layers" : [
-
-      ],
-      "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.5
-      },
-      "translucency" : {
-        "enabled" : true,
-        "value" : 0.5
+        "value" : 0.1
       }
     }
   ],
